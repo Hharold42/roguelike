@@ -249,16 +249,17 @@ export class Sword extends Weapon {
 
   override update(dt: number): void {
     super.update(dt);
-    // Текущий взмах: урон в середине (клинок проходит сектор), в конце — следующий из серии
+    // Текущий взмах: урон в середине (клинок проходит сектор), в конце — следующий из серии.
+    // Взмахи ускоряются вместе с кулдауном, иначе длинная серия не влезала бы в скорострельность.
     if (this.swing) {
-      this.swing.t += dt / SWING_TIME;
+      this.swing.t += dt / (SWING_TIME * this.stats.cooldownMult);
       if (!this.swing.hit && this.swing.t >= 0.5) {
         this.swing.hit = true;
         this.strike();
       }
       if (this.swing.t >= 1) {
         this.swing = null;
-        this.gap = SWING_GAP;
+        this.gap = SWING_GAP * this.stats.cooldownMult;
       }
     } else if (this.queue > 0) {
       this.gap -= dt;

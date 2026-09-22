@@ -24,6 +24,7 @@ import {
   loadGlbCharacter,
   PLAYER_MODEL_URL,
   type CharacterModel,
+  type HeldWeapon,
 } from "./characterModel";
 import type { MotionState } from "./motion";
 
@@ -94,6 +95,8 @@ const skelBox = $<HTMLInputElement>("skeleton");
 const wireBox = $<HTMLInputElement>("wireframe");
 const yawRange = $<HTMLInputElement>("yaw");
 const yawVal = $<HTMLSpanElement>("yawVal");
+const weaponSel = $<HTMLSelectElement>("weapon");
+const heldWeapon = () => weaponSel.value as HeldWeapon;
 const infoEl = $<HTMLDivElement>("info");
 const statusEl = $<HTMLDivElement>("status");
 const dropEl = $<HTMLDivElement>("drop");
@@ -173,7 +176,7 @@ function setModel(next: CharacterModel): void {
 async function openFile(file: File): Promise<void> {
   setStatus(`Загрузка ${file.name}…`);
   try {
-    const glb = await loadGlbCharacter(scene, file);
+    const glb = await loadGlbCharacter(scene, file, { weapon: heldWeapon() });
     if (!glb) {
       setStatus(`${file.name}: модель отклонена (слишком тяжёлая — см. консоль)`, "warn");
       return;
@@ -197,6 +200,7 @@ function loadDefault(): void {
         setStatus(`Загружено: ${PLAYER_MODEL_URL}`, "ok");
       },
       (err) => setStatus(`Ошибка загрузки ${PLAYER_MODEL_URL}: ${(err as Error).message ?? err}`, "warn"),
+      heldWeapon(),
     ),
   );
   // Если GLB нет, статус остаётся «загрузка» — уточним по HEAD
@@ -220,8 +224,13 @@ $<HTMLInputElement>("file").addEventListener("change", (e) => {
 });
 $<HTMLButtonElement>("reload").addEventListener("click", loadDefault);
 $<HTMLButtonElement>("procedural").addEventListener("click", () => {
-  setModel(buildProceduralCharacter(scene));
+  setModel(buildProceduralCharacter(scene, { weapon: heldWeapon() }));
   setStatus("Процедурный персонаж");
+});
+// Смена оружия — перезагружаем текущую модель (файл из окна — снова перетащите)
+weaponSel.addEventListener("change", () => {
+  if (model?.info.source === "процедурная") setModel(buildProceduralCharacter(scene, { weapon: heldWeapon() }));
+  else loadDefault();
 });
 
 window.addEventListener("dragover", (e) => {
