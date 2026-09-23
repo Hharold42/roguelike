@@ -61,8 +61,12 @@ export class Player {
   regen = 0;
   /** Общие характеристики всех оружий (ручной пистолет, летающий, …): урон, мультивыстрел, скорострельность */
   readonly weaponStats = new WeaponStats();
-  /** Собранное золото (валюта прокачки оружия) */
+  /** Собранное золото (валюта колеса фортуны) */
   gold = 0;
+  /** Заряды щита: каждый поглощает один удар целиком */
+  shield = 0;
+  /** Доп. золото с каждого убитого врага */
+  goldBonus = 0;
 
   private baseSpeed = 9;
 
@@ -288,7 +292,14 @@ export class Player {
     );
   }
 
-  takeDamage(amount: number): void {
+  /** Урон по игроку; заряд щита поглощает удар целиком. Возвращает true, если щит сработал */
+  takeDamage(amount: number): boolean {
+    if (amount <= 0) return false;
+    if (this.shield > 0) {
+      this.shield--;
+      return true;
+    }
     this.hp = Math.max(0, this.hp - amount);
+    return false;
   }
 }

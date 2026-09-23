@@ -5,7 +5,14 @@ export interface UpgradeDef {
   title: string;
   desc: string;
   apply: (p: Player) => void;
+  /** Откат одного применения — рецепты крафта тратят бафы как ингредиенты */
+  undo: (p: Player) => void;
 }
+
+const HP_STEP = 25;
+const RATE_MULT = 0.82;
+const SPEED_MULT = 1.12;
+const REGEN_STEP = 0.8;
 
 /**
  * Пул улучшений, из которых игрок выбирает после каждого этапа.
@@ -15,10 +22,14 @@ export const UPGRADE_POOL: UpgradeDef[] = [
   {
     id: "hp",
     title: "Живучесть",
-    desc: "+25 к макс. HP и лечение на 25",
+    desc: `+${HP_STEP} к макс. HP и лечение на ${HP_STEP}`,
     apply: (p) => {
-      p.maxHp += 25;
-      p.hp = Math.min(p.maxHp, p.hp + 25);
+      p.maxHp += HP_STEP;
+      p.hp = Math.min(p.maxHp, p.hp + HP_STEP);
+    },
+    undo: (p) => {
+      p.maxHp = Math.max(HP_STEP, p.maxHp - HP_STEP);
+      p.hp = Math.min(p.hp, p.maxHp);
     },
   },
   {
@@ -26,7 +37,10 @@ export const UPGRADE_POOL: UpgradeDef[] = [
     title: "Скорострельность",
     desc: "Все оружия стреляют на 18% быстрее",
     apply: (p) => {
-      p.weaponStats.cooldownMult *= 0.82;
+      p.weaponStats.cooldownMult *= RATE_MULT;
+    },
+    undo: (p) => {
+      p.weaponStats.cooldownMult /= RATE_MULT;
     },
   },
   {
@@ -36,13 +50,19 @@ export const UPGRADE_POOL: UpgradeDef[] = [
     apply: (p) => {
       p.weaponStats.damage += 1;
     },
+    undo: (p) => {
+      p.weaponStats.damage = Math.max(1, p.weaponStats.damage - 1);
+    },
   },
   {
     id: "speed",
     title: "Лёгкие ноги",
     desc: "+12% к скорости бега",
     apply: (p) => {
-      p.speedMult *= 1.12;
+      p.speedMult *= SPEED_MULT;
+    },
+    undo: (p) => {
+      p.speedMult /= SPEED_MULT;
     },
   },
   {
@@ -52,16 +72,26 @@ export const UPGRADE_POOL: UpgradeDef[] = [
     apply: (p) => {
       p.weaponStats.projectiles += 1;
     },
+    undo: (p) => {
+      p.weaponStats.projectiles = Math.max(1, p.weaponStats.projectiles - 1);
+    },
   },
   {
     id: "regen",
     title: "Регенерация",
-    desc: "+0.8 HP в секунду",
+    desc: `+${REGEN_STEP} HP в секунду`,
     apply: (p) => {
-      p.regen += 0.8;
+      p.regen += REGEN_STEP;
+    },
+    undo: (p) => {
+      p.regen = Math.max(0, p.regen - REGEN_STEP);
     },
   },
 ];
+
+export function upgradeTitle(id: string): string {
+  return UPGRADE_POOL.find((u) => u.id === id)?.title ?? id;
+}
 
 /** Случайные count различных улучшений */
 export function rollUpgrades(count = 3): UpgradeDef[] {

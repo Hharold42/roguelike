@@ -20,6 +20,7 @@ import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData";
 import { SubMesh } from "@babylonjs/core/Meshes/subMesh";
 import { detectHumanoidRig, type HumanoidRig } from "./humanoidRig";
 import { clamp, smoothstep, type MotionState } from "./motion";
+import { loadGunTemplate, type WeaponMesh, type WeaponTemplate } from "./weaponModel";
 
 /**
  * Визуальная модель персонажа. Крепится дочерним узлом к невидимому коллайдеру-капсуле,
@@ -344,6 +345,8 @@ export async function loadGlbCharacter(
     }
   }
 
+  // Пистолет из файла стартуем сразу, чтобы он грузился параллельно с персонажем
+  if (opt.weapon === "gun") void loadGunTemplate(scene);
   const result = await ImportMeshAsync(source, scene);
   let meshes = result.meshes.filter((m) => m.getTotalVertices() > 0);
   const total = triangleCount(meshes);
@@ -379,6 +382,8 @@ export async function loadGlbCharacter(
     groups: result.animationGroups,
     opt,
     weapon: opt.weapon,
+    // Пистолет из файла грузится параллельно с персонажем (кэш на сцену), к этому моменту он обычно готов
+    gunModel: opt.weapon === "gun" ? await loadGunTemplate(scene) : null,
   });
 }
 
@@ -396,6 +401,8 @@ interface AssembleInput {
   opt: Required<GlbOptions>;
   /** Что вложить в правую руку */
   weapon: HeldWeapon;
+  /** Загруженная модель пистолета (null — заглушка из примитивов) */
+  gunModel?: WeaponTemplate | null;
   /** Масштаб всего персонажа (рост = height × scale) */
   scale?: number;
   /** Перекрасить все материалы (враги) */
@@ -467,7 +474,7 @@ function assembleCharacter(inp: AssembleInput): CharacterModel {
   // Оружие-заглушка в оружейной руке (пока нет моделей оружия)
   const gun =
     inp.weapon !== "none" && rig?.weaponHand
-      ? attachHeldWeapon(scene, rig.weaponHand.node, rig.weaponHand.forward, inp.weapon)
+      ? attachHeldWeapon(scene, rig.weaponHand.node, rig.weaponHand.forward, inp.weapon, inp.gunModel ?? null)
       : null;
   if (gun) {
     gun.root.scaling.setAll(inp.scale ?? 1); // оружие живёт в мировых координатах, масштаб задаём ему отдельно
@@ -533,6 +540,7 @@ function assembleCharacter(inp: AssembleInput): CharacterModel {
     },
     dispose() {
       for (const g of groups) g.dispose();
+      gun?.dispose();
       gun?.root.dispose(false, true);
       holder.dispose(false, true);
       skeleton?.dispose();
@@ -694,6 +702,7 @@ interface AttachedGun {
   sync(): void;
   /** Мировая позиция среза ствола */
   muzzle(): Vector3;
+  dispose(): void;
 }
 
 /** Срез ствола заглушки в локальных координатах оружия */
@@ -737,8 +746,22 @@ export function buildSwordMesh(scene: Scene, name = "sword"): { root: TransformN
  * а каждый кадр ставим в мировую позицию кисти с фиксированным смещением поворота,
  * вычисленным один раз: ствол/клинок — вдоль предплечья (handForward), рукоять — вниз.
  */
-function attachHeldWeapon(scene: Scene, hand: TransformNode, handForward: Vector3, kind: HeldWeapon): AttachedGun {
-  const { root, meshes } = kind === "sword" ? buildSwordMesh(scene) : buildGunMesh(scene);
+function attachHeldWeapon(
+  scene: Scene,
+  hand: TransformNode,
+  handForward: Vector3,
+  kind: HeldWeapon,
+  gunModel: WeaponTemplate | null,
+): AttachedGun {
+  // Пистолет — из файла, если он загружен; иначе (и для меча) — примитивы
+  const held: WeaponMesh =
+    kind === "sword"
+      ? { ...buildSwordMesh(scene), muzzleLocal: GUN_MUZZLE_LOCAL, dispose() {} }
+      : gunModel
+        ? gunModel.instantiate("gun")
+        : { ...buildGunMesh(scene), muzzleLocal: GUN_MUZZLE_LOCAL, dispose() {} };
+  const { root, meshes } = held;
+  if (!root.rotationQuaternion) root.rotationQuaternion = Quaternion.Identity();
 
   const scale = new Vector3();
   const rot = new Quaternion();
@@ -765,10 +788,10 @@ function attachHeldWeapon(scene: Scene, hand: TransformNode, handForward: Vector
 
   const muzzle = () => {
     root.computeWorldMatrix(true);
-    return Vector3.TransformCoordinates(GUN_MUZZLE_LOCAL, root.getWorldMatrix());
+    return Vector3.TransformCoordinates(held.muzzleLocal, root.getWorldMatrix());
   };
 
-  return { root, meshes, sync, muzzle };
+  return { root, meshes, sync, muzzle, dispose: () => held.dispose() };
 }
 
 /**

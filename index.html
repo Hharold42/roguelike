@@ -85,6 +85,26 @@
       }
       #goldHint { display: none; font-size: 13px; color: #ffe08a; opacity: 0.9; max-width: 340px; line-height: 1.3; }
       #hud .weapons { font-size: 13px; color: #8fd8ff; }
+      /* Сводка справа сверху: оружие, автоматика, статы, предметы, бафы */
+      #statsHud {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        max-width: 360px;
+        text-align: right;
+        color: #e8e8f0;
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        font-size: 13px;
+        line-height: 1.45;
+        user-select: none;
+        pointer-events: none;
+        text-shadow: 0 1px 3px #000;
+        opacity: 0.92;
+      }
+      #statsHud .h { margin-top: 6px; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: #ffd166; opacity: 0.85; }
+      #statsHud .h:first-child { margin-top: 0; }
+      #statsHud b { color: #fff; font-weight: 600; }
+      #statsHud .buff { color: #9fe07a; }
       #flash {
         position: fixed;
         top: 18%;
@@ -149,6 +169,116 @@
         opacity: 0.85;
         line-height: 1.4;
       }
+      /* --- Колесо фортуны --- */
+      #wheelOverlay, #bonusOverlay { background: rgba(5, 5, 10, 0.86); }
+      #wheelOverlay h1, #bonusOverlay h1 { color: #ffd166; margin-bottom: 4px; }
+      #bonusOverlay { background: rgba(5, 5, 10, 0.97); } /* поверх основного колеса — оно не должно просвечивать */
+      #bonusOverlay h1 { color: #9fe07a; }
+      #wheelOverlay .sub, #bonusOverlay .sub { font-size: 15px; opacity: 0.7; margin: 0 0 14px; }
+      .wheelRow { display: flex; gap: 32px; align-items: flex-start; }
+      .wheelCol { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+      .wheelCol canvas { width: 540px; height: 540px; }
+      .wheelPrice { font-size: 17px; }
+      .wheelPrice b { color: #ffd166; }
+      .wheelBtns { display: flex; gap: 12px; }
+      .wheelBtns button {
+        padding: 10px 22px;
+        font: 600 17px 'Segoe UI', system-ui, sans-serif;
+        color: #0d0d14;
+        background: #ffd166;
+        border: 0;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      .wheelBtns button:disabled { opacity: 0.45; cursor: default; }
+      .wheelBtns button.secondary { background: #33334a; color: #e8e8f0; }
+      .wheelResult { min-height: 24px; font-size: 17px; max-width: 540px; text-align: center; }
+      .wheelResult.win { color: #9fe07a; }
+      .wheelResult.lose { color: #8a8aa0; }
+      .wheelLegend {
+        list-style: none;
+        margin: 0;
+        padding: 0 8px 0 0;
+        width: 340px;
+        max-height: 600px;
+        overflow-y: auto;
+        font-size: 13px;
+      }
+      .wheelLegend li { display: grid; grid-template-columns: 14px 1fr auto; column-gap: 8px; padding: 5px 0; border-bottom: 1px solid #22222f; }
+      .wheelLegend li .sw { width: 12px; height: 12px; border-radius: 3px; margin-top: 3px; background: #22222f; }
+      .wheelLegend li b { color: #f4f4f8; }
+      .wheelLegend li .pct { color: #ffd166; font-weight: 600; }
+      .wheelLegend li div { grid-column: 2 / 4; opacity: 0.7; line-height: 1.3; }
+      .wheelLegend li.empty b { color: #8a8aa0; }
+      /* --- Вкладки экрана B: колесо / магазин / крафт --- */
+      .tabs { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; width: min(960px, 94vw); }
+      .tabs button {
+        padding: 9px 18px;
+        font: 600 16px 'Segoe UI', system-ui, sans-serif;
+        color: #e8e8f0;
+        background: #1a1a26;
+        border: 2px solid #33334a;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      .tabs button.active { border-color: #ffd166; color: #ffd166; }
+      .tabs button kbd { font: 12px monospace; opacity: 0.6; margin-left: 6px; }
+      .tabs .tabGold { margin-left: auto; color: #ffcf5a; font-weight: 600; font-size: 17px; }
+      .tabs .tabClose { background: #33334a; }
+      .tabPanel { display: flex; flex-direction: column; align-items: center; }
+      .shopBar { display: flex; gap: 14px; align-items: center; margin-bottom: 10px; min-height: 34px; }
+      .toggle {
+        padding: 7px 14px;
+        font: 600 14px 'Segoe UI', system-ui, sans-serif;
+        color: #e8e8f0;
+        background: #1a1a26;
+        border: 2px solid #33334a;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .toggle.on { border-color: #9fe07a; color: #9fe07a; }
+      .toggle:disabled { opacity: 0.4; cursor: default; }
+      .shopMsg { font-size: 14px; color: #9fe07a; min-height: 18px; }
+      .shopMsg.err { color: #ff8a8a; }
+      .shopCols { display: flex; gap: 36px; align-items: flex-start; }
+      .shopCols > div:first-child { width: 684px; } /* 3 карточки по 220 + 2 зазора */
+      .shopCols > div:last-child { width: 452px; } /* 2 карточки */
+      .shopCols h3 { margin: 0 0 8px; font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; color: #ffd166; opacity: 0.85; }
+      .shopCards { display: flex; flex-wrap: wrap; gap: 12px; }
+      .shopCards.craft { max-width: 940px; max-height: 70vh; overflow-y: auto; padding: 4px; justify-content: center; }
+      .shopCard {
+        box-sizing: border-box;
+        width: 220px;
+        padding: 12px 14px;
+        background: #15151f;
+        border: 2px solid #33334a;
+        border-radius: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        text-align: left;
+      }
+      .shopCard.ok { border-color: #3d5a3d; }
+      .shopCard h4 { margin: 0; font-size: 16px; color: #ffd166; }
+      .shopCard p { margin: 0; font-size: 13px; opacity: 0.8; line-height: 1.35; }
+      .shopCard ul { margin: 0; padding: 0; list-style: none; font-size: 13px; }
+      .shopCard li::before { content: "✕ "; color: #ff8a8a; }
+      .shopCard li.have::before { content: "✓ "; color: #9fe07a; }
+      .shopCard li.have { color: #d8f0c8; }
+      .shopCard .buy {
+        margin-top: auto;
+        padding: 7px 10px;
+        font: 600 14px 'Segoe UI', system-ui, sans-serif;
+        color: #0d0d14;
+        background: #ffd166;
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .shopCard .buy:disabled { opacity: 0.4; cursor: default; }
+      .shopCard .buy.sell { background: #33334a; color: #e8e8f0; }
+      .shopCard .buy s { opacity: 0.6; margin-right: 6px; }
+      .shopEmpty { opacity: 0.6; font-size: 14px; padding: 12px; }
       #viewerLink {
         position: fixed;
         right: 12px;
@@ -172,13 +302,14 @@
       <div class="goldRow">
         <span class="goldLabel">Золото</span>
         <div id="goldBar"><div id="goldFill"></div></div>
-        <span class="goldText" id="gold">0/100</span>
+        <span class="goldText" id="gold">0/50</span>
       </div>
       <div id="weapons" class="weapons"></div>
       <div id="goldHint"></div>
     </div>
+    <div id="statsHud"></div>
     <div id="crosshair"></div>
-    <div id="lockHint">Кликните по полю, чтобы захватить мышь · WASD — движение · пробел — прыжок · Ctrl / C — присед · мышь — камера · колесо — дистанция · ЛКМ — атака · B — купить улучшение · Esc — отпустить</div>
+    <div id="lockHint">Кликните по полю, чтобы захватить мышь · WASD — движение · пробел — прыжок · Ctrl / C — присед · мышь — камера · колесо — дистанция · ЛКМ — атака · B — колесо фортуны / магазин / крафт · Esc — отпустить</div>
     <div id="flash"></div>
     <div id="overlay" class="screen">
       <h1>ВЫ ПОГИБЛИ</h1>
@@ -188,6 +319,67 @@
       <h1>Выберите оружие</h1>
       <p>Улучшения урона, скорострельности и мультивыстрела действуют на любое оружие:</p>
       <div id="weaponCards" class="cards"></div>
+    </div>
+    <div id="wheelOverlay" class="screen">
+      <div id="shopTabs" class="tabs">
+        <button data-tab="wheel" class="active">Колесо фортуны <kbd>1</kbd></button>
+        <button data-tab="shop">Магазин <kbd>2</kbd></button>
+        <button data-tab="craft">Крафт <kbd>3</kbd></button>
+        <span id="shopGold" class="tabGold"></span>
+        <button id="shopClose" class="tabClose">Закрыть (Esc)</button>
+      </div>
+      <div id="tabWheel" class="tabPanel">
+        <p class="sub">Каждое вращение дороже предыдущего. Выигранное оружие уходит с колеса, предметы остаются.</p>
+        <div class="wheelRow">
+          <div class="wheelCol">
+            <canvas id="wheelCanvas" width="540" height="540"></canvas>
+            <div id="wheelPrice" class="wheelPrice"></div>
+            <div class="wheelBtns">
+              <button id="wheelSpin">Крутить</button>
+              <button id="wheelClose" class="secondary">Закрыть (Esc)</button>
+            </div>
+            <div id="wheelResult" class="wheelResult"></div>
+          </div>
+          <ul id="wheelLegend" class="wheelLegend"></ul>
+        </div>
+      </div>
+      <div id="tabShop" class="tabPanel" style="display: none">
+        <p class="sub">Ассортимент обновляется каждый этап: три предмета и одно оружие. Гарантированно, но дорого.</p>
+        <div class="shopBar">
+          <button id="shopCoupon" class="toggle"></button>
+          <span id="shopMsg" class="shopMsg"></span>
+        </div>
+        <div class="shopCols">
+          <div>
+            <h3>На продажу</h3>
+            <div id="shopStock" class="shopCards"></div>
+          </div>
+          <div>
+            <h3>Ваша автоматика</h3>
+            <div id="shopSell" class="shopCards"></div>
+          </div>
+        </div>
+      </div>
+      <div id="tabCraft" class="tabPanel" style="display: none">
+        <p class="sub">Рецепт тратит ингредиенты: бафы откатываются, оружие уходит. Результат — улучшение вашего оружия или новое.</p>
+        <div id="craftList" class="shopCards craft"></div>
+      </div>
+    </div>
+    <div id="bonusOverlay" class="screen">
+      <h1>Утешительное колесо</h1>
+      <p class="sub">Крутится само и бесплатно: одно из обычных улучшений… или, с шансом 2 %, десять боссов.</p>
+      <div class="wheelRow">
+        <div class="wheelCol">
+          <canvas id="bonusCanvas" width="540" height="540"></canvas>
+          <div id="bonusPrice" class="wheelPrice"></div>
+          <div class="wheelBtns">
+            <button id="bonusSpin">Крутить</button>
+            <button id="bonusClose" class="secondary">Забрать (Esc)</button>
+          </div>
+          <div id="bonusResult" class="wheelResult"></div>
+        </div>
+        <ul id="bonusLegend" class="wheelLegend"></ul>
+      </div>
     </div>
     <div id="upgradeOverlay" class="screen">
       <h1>Этап пройден!</h1>
