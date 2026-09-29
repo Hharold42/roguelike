@@ -102,12 +102,13 @@ const apronKind = new Uint8Array(APRON_N * APRON_N);
 
 /** Результат билинейного сэмпла рельефа (см. ColumnMap.sampleGround) */
 export interface GroundSample {
-  h: number;
+  h: number; // сглаженная высота поверхности (земля + скруглённые валуны)
+  ground: number; // сглаженная высота чистого рельефа (для оттенка скал)
   light: number; // 0..1
-  rgb: [number, number, number]; // базовый цвет 0..1
+  rgb: [number, number, number]; // базовый цвет земли 0..1
 }
 /** Scratch для вызовов heightAt/sampleGround вне горячего цикла рендера */
-const GROUND_SCRATCH: GroundSample = { h: 0, light: 0, rgb: [0, 0, 0] };
+const GROUND_SCRATCH: GroundSample = { h: 0, ground: 0, light: 0, rgb: [0, 0, 0] };
 
 export class ColumnMap {
   /** Плоские массивы окна: слот × 256 колонок. Рендер читает их напрямую. */
@@ -147,22 +148,25 @@ export class ColumnMap {
   }
 
   /**
-   * Высота поверхности в точке: стены/сооружения — по колонне (блоки),
-   * голый рельеф — билинейно сглаженный (совпадает с terrain.getHeight).
+   * Высота поверхности в точке: сооружения — по колонне (блоки, ярусы зиккурата
+   * обязаны быть ровными), земля и валуны — билинейно сглаженные (валуны
+   * скругляются в склоны; совпадает с terrain.getHeight вне стен).
    * Незапечённое — напрямую из террейна (рейкасты, спрайты).
    */
   heightAt(wx: number, wz: number): number {
     const i = this.columnIndexAt(wx, wz);
     if (i < 0) return this.terrain.floorAt(wx, wz);
-    if (this.colKind[i] >= 1) return this.colH[i];
+    if (this.colKind[i] >= 2) return this.colH[i];
     return this.sampleGround(wx, wz, GROUND_SCRATCH) ? GROUND_SCRATCH.h : this.terrain.getHeight(wx, wz);
   }
 
   /**
-   * Билинейный сэмпл рельефа: высота, свет и базовый цвет интерполируются
-   * между центрами 4 соседних колонн — земля рисуется плавной, без сетки 2×2.
-   * (colGround — это getHeight в узлах той же сетки, поэтому билинейная
-   * интерполяция воспроизводит аналитический рельеф точно.)
+   * Билинейный сэмпл поверхности: высота, свет и базовый цвет интерполируются
+   * между центрами 4 соседних колонн — земля рисуется плавной, без сетки 2×2,
+   * а валуны (kind 1) скругляются: их верх входит в поле высот, и грани
+   * превращаются в склоны. Сооружения (kind ≥ 2) в поле не участвуют — они
+   * рисуются блоками поверх. (colGround — getHeight в узлах той же сетки,
+   * поэтому вне стен интерполяция воспроизводит аналитический рельеф точно.)
    * false — хоть одна из 4 колонн не запечена.
    */
   sampleGround(wx: number, wz: number, out: GroundSample): boolean {
@@ -180,11 +184,21 @@ export class ColumnMap {
     const g = this.colGround;
     const l = this.colLight;
     const c = this.colColor;
-    const h0 = g[i00] + (g[i10] - g[i00]) * u;
-    const h1 = g[i01] + (g[i11] - g[i01]) * u;
+    const k = this.colKind;
+    const hh = this.colH;
+    // Поле поверхности: валун — его верх (с джиттером), иначе — рельеф
+    const f00 = k[i00] === 1 ? hh[i00] : g[i00];
+    const f10 = k[i10] === 1 ? hh[i10] : g[i10];
+    const f01 = k[i01] === 1 ? hh[i01] : g[i01];
+    const f11 = k[i11] === 1 ? hh[i11] : g[i11];
+    const h0 = f00 + (f10 - f00) * u;
+    const h1 = f01 + (f11 - f01) * u;
+    const g0 = g[i00] + (g[i10] - g[i00]) * u;
+    const g1 = g[i01] + (g[i11] - g[i01]) * u;
     const l0 = l[i00] + (l[i10] - l[i00]) * u;
     const l1 = l[i01] + (l[i11] - l[i01]) * u;
     out.h = h0 + (h1 - h0) * v;
+    out.ground = g0 + (g1 - g0) * v;
     out.light = (l0 + (l1 - l0) * v) / 255;
     for (let ch = 0; ch < 3; ch++) {
       const o00 = i00 * 3 + ch;

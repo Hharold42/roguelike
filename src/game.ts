@@ -85,8 +85,8 @@ const BULLET_BLAST_MULT = 0.5; // урон взрыва пули (гранато
 
 // --- Камера первого лица ---
 const MOUSE_SENS = 0.0023; // рад yaw на пиксель мыши
-const PITCH_SENS = 0.7; // сдвиг горизонта, px на px мыши
-const PITCH_RANGE = 0.45; // доля высоты экрана, на которую уезжает горизонт (кламп рендера: 5–95 %)
+const PITCH_SENS = 0.0023; // рад на пиксель мыши (как MOUSE_SENS)
+const PITCH_MAX = 1.0; // рад (~57°) вверх/вниз — дальше voxel-проекция теряет смысл
 const BOB_FREQ = 1.9; // частота покачивания камеры при беге
 const BOB_AMP = 0.045; // амплитуда по вертикали, юниты
 const MUZZLE_FLASH_TIME = 0.06; // с, вспышка выстрела на вьюмодели
@@ -131,12 +131,13 @@ export class Game {
 
   // --- Камера ---
   private camYaw = 0;
-  /** Сдвиг горизонта в пикселях экрана (pitch) */
-  private pitchPx = 0;
+  /** Наклон камеры, рад: > 0 — взгляд вверх */
+  private pitch = 0;
   private locked = false;
   private bobPhase = 0;
   private muzzleFlashT = 0;
   private damageFlashT = 0;
+  private fovKick = 0; // затухающий всплеск FOV после рывка меча
 
   // --- Состояние этапа ---
   private terrain!: Terrain;
@@ -250,10 +251,9 @@ export class Game {
     window.addEventListener("mousemove", (e) => {
       if (!this.locked) return;
       this.camYaw += e.movementX * MOUSE_SENS;
-      // мышь вверх (movementY < 0) — смотрим вверх: горизонт едет вниз по экрану
-      this.pitchPx -= e.movementY * PITCH_SENS;
-      const range = this.renderer.H * PITCH_RANGE;
-      this.pitchPx = Math.max(-range, Math.min(range, this.pitchPx));
+      // мышь вверх (movementY < 0) — смотрим вверх
+      this.pitch -= e.movementY * PITCH_SENS;
+      this.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, this.pitch));
     });
 
     window.addEventListener("keydown", (e) => {
@@ -874,7 +874,10 @@ export class Game {
       pos.z = nz;
       moved += step;
     }
-    if (moved > 0) pos.y = Math.max(pos.y, this.floorAtRendered(pos.x, pos.z) + 1);
+    if (moved > 0) {
+      pos.y = Math.max(pos.y, this.floorAtRendered(pos.x, pos.z) + 1);
+      this.fovKick = 1; // всплеск FOV — ощущение ускорения
+    }
   }
 
   private tickTimedBuffs(dt: number): void {
@@ -1232,12 +1235,10 @@ export class Game {
     return new Vector3(p.x, this.player.eyeY() + bob, p.z);
   }
 
-  /** Направление взгляда с учётом сдвига горизонта (согласовано с проекцией рендера) */
+  /** Направление взгляда — истинный базис камеры с наклоном (как в рендере) */
   private aimDir(): Vector3 {
-    // Строка sy экрана соответствует лучу с подъёмом (horizon − sy)/focal; центр — sy = H/2
-    const up = this.pitchPx / this.renderer.focal;
-    const dir = new Vector3(Math.sin(this.camYaw), up, Math.cos(this.camYaw));
-    return dir.normalize();
+    const cp = Math.cos(this.pitch);
+    return new Vector3(Math.sin(this.camYaw) * cp, Math.sin(this.pitch), Math.cos(this.camYaw) * cp).normalize();
   }
 
   /**
@@ -1279,7 +1280,10 @@ export class Game {
   private render(dt: number): void {
     const r = this.renderer;
     const eye = this.eyePos();
-    r.begin(eye.x, eye.y, eye.z, this.camYaw, r.H / 2 + this.pitchPx);
+    // FOV-кик рывка: быстрый всплеск, квадратичное затухание (~0.3 с)
+    this.fovKick = Math.max(0, this.fovKick - dt * 3.2);
+    r.fovScale = 1 + 0.13 * this.fovKick * this.fovKick;
+    r.begin(eye.x, eye.y, eye.z, this.camYaw, this.pitch);
 
     // Враги — спрайты: кадр ходьбы по фазе, замах — атакующий кадр
     for (const e of this.enemies) {

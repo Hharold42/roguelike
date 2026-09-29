@@ -9,8 +9,10 @@
  * вьюмодель оружия и виньетка урона.
  * Сверху всего — палитра 6 уровней с дизерингом Байера 4×4, инлайн при записи.
  *
- * Наклон камеры (pitch) — сдвиг строки горизонта, а не настоящий поворот луча;
- * прицеливание согласовано с этим (см. aimDir в game.ts).
+ * Наклон камеры (pitch) — истинный: каждый столбец экрана марширует по
+ * горизонтальному следу своей лучевой плоскости, а высоты проецируются через
+ * настоящие fd/ud пинхол-камеры — мир поворачивается, а не «сползает».
+ * Прицеливание согласовано (см. aimDir в game.ts — тот же базис камеры).
  */
 
 import { ColumnMap, FOG_COL, SKY_TOP, STRUCT_COL, SUN_X, SUN_Z, WALL_COL } from "./columnMap";
@@ -57,7 +59,7 @@ function speckle(wx: number, wz: number): number {
 }
 
 // Scratch билинейного сэмпла земли для горячего цикла renderWorld (без GC)
-const GS: GroundSample = { h: 0, light: 0, rgb: [0, 0, 0] };
+const GS: GroundSample = { h: 0, ground: 0, light: 0, rgb: [0, 0, 0] };
 
 /** Тинт спрайта — любой объект с каналами r/g/b (Color3 тоже подходит) */
 export interface Tint {
@@ -123,6 +125,9 @@ export class SoftRenderer {
   W = 320;
   H = 240;
   focal = 0;
+  private baseFocal = 0;
+  /** Масштаб фокуса на кадр (FOV-кик рывка): >1 — шире угол, эффект скорости */
+  fovScale = 1;
   private img!: ImageData;
   private pix!: Uint8ClampedArray;
   private zbuf!: Float32Array; // глубина ближайшего окклюдера по пикселю (Z_FAR — небо)
@@ -135,7 +140,9 @@ export class SoftRenderer {
   private camZ = 0;
   private sinY = 0;
   private cosY = 1;
-  private horizon = 0;
+  private sinP = 0; // pitch: > 0 — взгляд вверх
+  private cosP = 1;
+  private horizonSy = 0; // экранная строка истинного горизонта (для неба и солнца)
 
   // Очереди кадра
   private sprites: QueuedSprite[] = [];
@@ -168,7 +175,8 @@ export class SoftRenderer {
     this.pix = this.img.data;
     this.zbuf = new Float32Array(this.W * this.H);
     this.sunAdd = new Float32Array(this.W);
-    this.focal = this.W / 2 / Math.tan(HFOV / 2);
+    this.baseFocal = this.W / 2 / Math.tan(HFOV / 2);
+    this.focal = this.baseFocal;
     // Виньетка: 0 в центре → 255 по краям
     this.edgeMask = new Uint8Array(this.W * this.H);
     for (let y = 0; y < this.H; y++) {
@@ -183,14 +191,18 @@ export class SoftRenderer {
 
   // ---------- Кадр ----------
 
-  /** Начать кадр: небо + мир. horizon — строка горизонта (сдвиг = pitch) */
-  begin(camX: number, camY: number, camZ: number, yaw: number, horizon: number): void {
+  /** Начать кадр: небо + мир. pitch — радианы, > 0 — взгляд вверх */
+  begin(camX: number, camY: number, camZ: number, yaw: number, pitch: number): void {
     this.camX = camX;
     this.camY = camY;
     this.camZ = camZ;
     this.sinY = Math.sin(yaw);
     this.cosY = Math.cos(yaw);
-    this.horizon = Math.max(this.H * 0.05, Math.min(this.H * 0.95, horizon));
+    this.sinP = Math.sin(pitch);
+    this.cosP = Math.cos(pitch);
+    this.focal = this.baseFocal * this.fovScale;
+    // Строка истинного горизонта; может уходить далеко за край экрана — нормально
+    this.horizonSy = this.H / 2 + (this.sinP / this.cosP) * this.focal;
     this.sprites.length = 0;
     this.streaks.length = 0;
     this.rings.length = 0;
@@ -274,9 +286,13 @@ export class SoftRenderer {
       const dot = Math.max(0, (dx * SUN_X + dz * SUN_Z) * inv);
       sunAdd[x] = Math.pow(dot, 24) * 0.9;
     }
+    // Градиент привязан к истинному горизонту: выше horizonSy — небо,
+    // ниже — дымка в цвет тумана (её перекроет мир). horizonSy может быть
+    // за пределами экрана — тогда весь фон небо или дымка целиком.
+    const hs = this.horizonSy;
     for (let y = 0; y < H; y++) {
-      const t = y / H;
-      const fall = 1 - t;
+      const t = hs > 0 ? Math.min(1, y / hs) : 1;
+      const fall = hs > 0 ? Math.max(0, 1 - y / hs) : 0;
       const r0 = SKY_TOP[0] + (FOG_COL[0] - SKY_TOP[0]) * t;
       const g0 = SKY_TOP[1] + (FOG_COL[1] - SKY_TOP[1]) * t;
       const b0 = SKY_TOP[2] + (FOG_COL[2] - SKY_TOP[2]) * t;
@@ -299,11 +315,15 @@ export class SoftRenderer {
     const colH = map.colH;
     const colKind = map.colKind;
     const colLight = map.colLight;
-    const horizon = this.horizon;
+    const sinP = this.sinP;
+    const cosP = this.cosP;
+    const halfH = H / 2;
     for (let x = 0; x < W; x++) {
       const u = (x - W / 2) / focal;
-      const dirX = this.sinY + u * this.cosY;
-      const dirZ = this.cosY - u * this.sinY;
+      // Направление марша — горизонтальный след лучевой плоскости столбца;
+      // при наклоне камеры шаг по земле сжимается на cosP (истинный pitch)
+      const dirX = this.sinY + u * this.cosY * cosP;
+      const dirZ = this.cosY - u * this.sinY * cosP;
       let yb = H;
       let t = Z_NEAR;
       const brow = x & 3;
@@ -311,11 +331,11 @@ export class SoftRenderer {
         const wx = this.camX + dirX * t;
         const wz = this.camZ + dirZ * t;
         const ci = map.columnIndexAt(wx, wz);
-        // Стены и сооружения рисуем блоками (брутализм — стиль), голую землю —
-        // билинейно сглаженной: плавные холмы вместо лесенки 2×2.
-        const wall = ci >= 0 && colKind[ci] >= 1;
+        // Блоками рисуются только мегаструктуры (брутализм — стиль); земля и
+        // валуны — билинейно сглажены: плавные холмы и скруглённые скалы.
+        const solid = ci >= 0 && colKind[ci] >= 2;
         let h: number;
-        if (wall) {
+        if (solid) {
           h = colH[ci];
         } else {
           if (!map.sampleGround(wx, wz, GS)) {
@@ -324,36 +344,40 @@ export class SoftRenderer {
           }
           h = GS.h;
         }
-        const sy = horizon - ((h - this.camY) * focal) / t;
+        // Истинная проекция пинхол-камеры с наклоном: fd — дальность вперёд,
+        // ud — высота над плоскостью взгляда (см. project — тот же базис)
+        const dh = h - this.camY;
+        const fd = t * cosP + dh * sinP;
+        if (fd < 0.05) {
+          t += 0.12 + t * 0.02;
+          continue; // точка за плоскостью кадра (крутой взгляд вверх)
+        }
+        const sy = halfH - ((dh * cosP - t * sinP) * focal) / fd;
         if (sy < yb) {
           const y0 = sy < 0 ? 0 : Math.ceil(sy);
           let r: number, g: number, b: number;
           let fogScale = 1;
-          if (wall) {
-            const kind = colKind[ci];
+          if (solid) {
+            // Мегаструктуры: мёртвый бетон, сквозь дымку читаются силуэтом (мегалофобия)
             const s = (0.55 + 0.45 * (colLight[ci] / 255)) * 0.9;
-            if (kind === 1) {
-              r = WALL_COL[0] * s;
-              g = WALL_COL[1] * s;
-              b = WALL_COL[2] * s;
-            } else {
-              // Мегаструктуры: мёртвый бетон, сквозь дымку читаются силуэтом (мегалофобия)
-              r = STRUCT_COL[0] * s;
-              g = STRUCT_COL[1] * s;
-              b = STRUCT_COL[2] * s;
-              fogScale = 0.55;
-            }
+            r = STRUCT_COL[0] * s;
+            g = STRUCT_COL[1] * s;
+            b = STRUCT_COL[2] * s;
+            fogScale = 0.55;
           } else {
-            // Земля: билинейный цвет (палитра + биом + снег) × сглаженный свет;
-            // вблизи — крапчатая текстура, затухающая к 35 юнитам (дальше — рябь)
+            // Земля и валуны: билинейный цвет (палитра + биом + снег) × сглаженный
+            // свет; скала — подмешивание WALL_COL по превышению над рельефом
+            // (подошва склона землистая, гребень — каменный); вблизи — крап
             const s = 0.45 + 0.55 * GS.light;
             let k = s;
             if (t < 35) k *= 1 + (speckle(wx, wz) - 1) * (1 - t / 35);
-            r = GS.rgb[0] * k;
-            g = GS.rgb[1] * k;
-            b = GS.rgb[2] * k;
+            let rock = (GS.h - GS.ground) / 1.1;
+            rock = rock <= 0 ? 0 : rock >= 1 ? 1 : rock;
+            r = (GS.rgb[0] + (WALL_COL[0] - GS.rgb[0]) * rock) * k;
+            g = (GS.rgb[1] + (WALL_COL[1] - GS.rgb[1]) * rock) * k;
+            b = (GS.rgb[2] + (WALL_COL[2] - GS.rgb[2]) * rock) * k;
           }
-          const fz = (t / Z_FAR) * 511;
+          const fz = (fd / Z_FAR) * 511;
           const f = FOG_LUT[fz > 511 ? 511 : fz | 0] * fogScale;
           r += (FOG_COL[0] - r) * f;
           g += (FOG_COL[1] - g) * f;
@@ -362,15 +386,15 @@ export class SoftRenderer {
           const gL = g * LEVELS;
           const bL = b * LEVELS;
           // Аутлайн: верхняя кромка спана (силуэт против неба/дали) и нижняя
-          // (подошва уступа) затемняются — только у стен и сооружений; земля
-          // гладкая, тёмные кромки превратили бы её в полосы.
+          // (подошва уступа) затемняются — только у сооружений; земля и скалы
+          // гладкие, тёмные кромки превратили бы их в полосы.
           const spanH = yb - y0;
-          const topEdge = wall ? (spanH >= 18 ? 2 : spanH >= 3 ? 1 : 0) : 0;
-          const botEdge = wall && spanH >= 10 ? 1 : 0;
+          const topEdge = solid ? (spanH >= 18 ? 2 : spanH >= 3 ? 1 : 0) : 0;
+          const botEdge = solid && spanH >= 10 ? 1 : 0;
           for (let y = y0; y < yb; y++) {
             const k = y - y0 < topEdge || yb - y <= botEdge ? 0.38 : 1;
             const pi = y * W + x;
-            zbuf[pi] = t;
+            zbuf[pi] = fd;
             const d = BAYER[((y & 3) << 2) | brow];
             const i = pi * 4;
             pix[i] = 255 * Math.min(1, Math.floor(rL * k + d) / LEVELS);
@@ -396,10 +420,15 @@ export class SoftRenderer {
 
   private drawSprite(s: QueuedSprite): void {
     const { W, H, focal, pix, zbuf } = this;
-    const fd = s.fd;
-    const cx = W / 2 + (s.ld * focal) / fd;
-    const yBot = this.horizon - ((s.yBase - this.camY) * focal) / fd;
-    const yTop = this.horizon - ((s.yBase + s.wh - this.camY) * focal) / fd;
+    // Истинная проекция подошвы и макушки (учитывает pitch камеры)
+    const pb = this.project(s.x, s.yBase, s.z);
+    if (!pb) return;
+    const pt = this.project(s.x, s.yBase + s.wh, s.z);
+    if (!pt) return;
+    const fd = pb.fd;
+    const cx = pb.sx;
+    const yBot = pb.sy;
+    const yTop = pt.sy;
     const halfW = ((s.ww * focal) / fd) * 0.5;
     const x0 = Math.max(0, Math.ceil(cx - halfW));
     const x1 = Math.min(W - 1, Math.floor(cx + halfW));
@@ -560,14 +589,20 @@ export class SoftRenderer {
     for (const r of this.rings) this.drawRingNow(r.x, r.y, r.z, r.radius, r.r, r.g, r.b, r.arcCenter, r.arcHalf);
   }
 
-  /** Проекция мировой точки; null — за камерой */
+  /**
+   * Проекция мировой точки пинхол-камерой с yaw и pitch; null — за камерой.
+   * Базис: forward = (sinY·cosP, sinP, cosY·cosP), right = (cosY, 0, −sinY),
+   * up = (−sinY·sinP, cosP, −cosY·sinP) — тот же, что в renderWorld.
+   */
   private project(x: number, y: number, z: number): { sx: number; sy: number; fd: number } | null {
     const dx = x - this.camX;
+    const dy = y - this.camY;
     const dz = z - this.camZ;
-    const fd = dx * this.sinY + dz * this.cosY;
+    const fd = (dx * this.sinY + dz * this.cosY) * this.cosP + dy * this.sinP;
     if (fd < 0.4) return null;
     const ld = dx * this.cosY - dz * this.sinY;
-    return { sx: this.W / 2 + (ld * this.focal) / fd, sy: this.horizon - ((y - this.camY) * this.focal) / fd, fd };
+    const ud = dy * this.cosP - (dx * this.sinY + dz * this.cosY) * this.sinP;
+    return { sx: this.W / 2 + (ld * this.focal) / fd, sy: this.H / 2 - (ud * this.focal) / fd, fd };
   }
 
   private drawStreakNow(x1: number, y1: number, z1: number, x2: number, y2: number, z2: number, r: number, g: number, b: number): void {
