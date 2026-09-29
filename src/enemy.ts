@@ -1,35 +1,20 @@
-import { Color3 } from "@babylonjs/core/Maths/math.color";
+import type { Color3 } from "@babylonjs/core/Maths/math.color";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import type { Material } from "@babylonjs/core/Materials/material";
-import { MultiMaterial } from "@babylonjs/core/Materials/multiMaterial";
-import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
-import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
-import type { Scene } from "@babylonjs/core/scene";
 import type { HeightFn } from "./player";
 import type { BlockedFn } from "./crowd";
-import {
-  buildProceduralCharacter,
-  CHARACTER_HEIGHT,
-  loadCharacterTemplate,
-  PLAYER_MODEL_URL,
-  tintCharacter,
-  type CharacterModel,
-  type CharacterTemplate,
-} from "./characterModel";
-import { clamp, type MotionState } from "./motion";
+import { clamp } from "./motion";
 
-/** Враг — та же модель, что игрок, но меньше */
+/** Враг — человечек-спрайт; рост базовой модели, от которого считается масштаб */
+const CHARACTER_HEIGHT = 2;
+/** Базовый масштаб врага (меньше игрока) */
 export const ENEMY_SCALE = 0.75;
 const ELITE_SCALE = 1.35; // относительно обычного (≈ рост игрока)
-const HIT_RADIUS = 0.35; // радиус капсулы попаданий при масштабе 1 (модель уже 0.5-юнитовой капсулы)
+const HIT_RADIUS = 0.35; // радиус капсулы попаданий при масштабе 1
 
 const ATTACK_RANGE = 1.35; // горизонтальная дистанция удара от центра врага до центра игрока
 const ATTACK_HEIGHT = 1.1; // разница высот ступней, при которой удар ещё достаёт (игрок на блоке — не достаёт)
 const ATTACK_COOLDOWN = 1.1; // секунды между замахами
 const ATTACK_WINDUP = 0.32; // замах: урон проходит в конце, если игрок всё ещё в зоне — можно отпрыгнуть
-const LUNGE = 0.45; // выпад модели вперёд на ударе (доля роста)
-const TURN_RATE = 9; // 1/с
 
 // --- Толпа: чтобы не шли колонной ---
 const SURROUND_DIST = 9; // ближе этого идём не по полю, а обходим игрока на свой угол
@@ -37,13 +22,9 @@ const FAN_ANGLE = 0.75; // рад: на сколько враг смещает �
 const JITTER_BIAS = 0.35; // постоянный боковой снос вдоль маршрута (у каждого свой)
 const JITTER_WANDER = 0.3; // и качающийся
 const SPEED_SPREAD = 0.2; // ±20 % к скорости — толпа растягивается
-const ANIM_DIST = 55; // дальше этого скелет не анимируем (экономия CPU)
 
 // --- Реакция на урон ---
 const HIT_FLASH_TIME = 0.18; // с, вспышка красным
-const HIT_FLASH_COLOR = new Color3(1, 0.06, 0.03); // самосвечение на пике: насыщенный красный
-const HIT_FLASH_ALBEDO = 0.25; // базовый цвет на пике гасится до этой доли — иначе выходит розово-белый, а не красный
-const HIT_FLASH_GLOW: [number, number, number] = [1, 0.1, 0.05]; // ореол GlowLayer (metadata.glow)
 
 /** Статы врага — растут с номером этапа */
 export interface EnemyStats {
@@ -53,26 +34,13 @@ export interface EnemyStats {
   tint: Color3;
   /** Золото за убийство */
   gold: number;
-  /** Элитный: крупнее и светится (подсветку включает Game через GlowLayer) */
+  /** Элитный: крупнее и ярче */
   elite?: boolean;
   /** Дополнительный множитель размера поверх обычного/элитного (боссы) */
   scale?: number;
 }
 
-const ELITE_GLOW = new Color3(1, 0.18, 0.12);
-
-/**
- * Дать материалу собственный объект цвета. При перекраске в материал кладут общий `tint` из статов,
- * а сеттеры Babylon (`expandToProperty`) игнорируют присваивание равного по значению цвета —
- * поэтому сначала подсовываем заведомо другой, затем копию.
- */
-function ownColor(current: Color3, set: (c: Color3) => void): Color3 {
-  const copy = current.clone();
-  set(new Color3(copy.r + 1, copy.g, copy.b));
-  return copy;
-}
-
-/** Итоговый масштаб модели врага: базовый × элитный × множитель босса */
+/** Итоговый масштаб врага: базовый × элитный × множитель босса */
 function enemyScale(stats: EnemyStats): number {
   return ENEMY_SCALE * (stats.elite ? ELITE_SCALE : 1) * (stats.scale ?? 1);
 }
@@ -80,58 +48,21 @@ function enemyScale(stats: EnemyStats): number {
 let nextId = 1;
 
 /**
- * Фабрика врагов: один раз грузит модель игрока как шаблон и клонирует её (свой скелет и риг
- * у каждого, меши склеены в один draw call). Пока шаблон грузится — процедурный человечек.
+ * Преследователь: идёт к игроку, обходя стены, окружает и бьёт вблизи с замахом.
+ * Рендер — спрайт (soft/renderer читает node.position, tint, walkPhase, attackK, flashK);
+ * здесь только логика. `node` — лёгкий держатель позиции, чтобы не трогать все места,
+ * где читается enemy.node.position.
  */
-export class EnemyFactory {
-  private template: CharacterTemplate | null = null;
-  /** Шаблон загружен (или не загрузился — тогда враги процедурные). До этого спавн лучше подождать. */
-  ready = false;
-
-  constructor(private scene: Scene) {
-    loadCharacterTemplate(scene, PLAYER_MODEL_URL)
-      .then((t) => {
-        this.template = t;
-        if (t) console.info("[enemy] шаблон врага загружен из", PLAYER_MODEL_URL);
-      })
-      .catch((err) => console.warn("[enemy] шаблон не загрузился, враги процедурные:", err))
-      .finally(() => (this.ready = true));
-  }
-
-  create(pos: Vector3, stats: EnemyStats): Enemy {
-    return new Enemy(this.scene, this.buildModel(stats), pos, stats);
-  }
-
-  private buildModel(stats: EnemyStats): CharacterModel {
-    const scale = enemyScale(stats);
-    // У боссов самосвечение слабее пропорционально размеру — иначе bloom заливает их в белый
-    const emissive = stats.elite ? ELITE_GLOW.scale(0.5 / (stats.scale ?? 1)) : stats.tint.scale(0.12);
-    let model: CharacterModel;
-    if (this.template) {
-      model = this.template.instantiate({ scale, tint: stats.tint, emissive, meshName: "enemy" });
-    } else {
-      model = buildProceduralCharacter(this.scene, { weapon: "none" });
-      model.root.scaling.setAll(scale);
-      tintCharacter(model, stats.tint, emissive);
-      for (const m of model.meshes) m.name = "enemy";
-    }
-    for (const m of model.meshes) {
-      m.isPickable = true;
-      // Свечение элиты; у боссов приглушено пропорционально размеру, иначе bloom заливает их в белый столб
-      if (stats.elite) m.metadata = { ...(m.metadata ?? {}), elite: true, glowMult: 1 / (stats.scale ?? 1) ** 2 };
-    }
-    return model;
-  }
-}
-
-/** Преследователь: идёт к игроку, обходя стены, окружает и бьёт вблизи с замахом. */
 export class Enemy {
   readonly id = nextId++;
-  /** Центр капсулы: движение и поворот. Модель — дочерний узел. */
-  readonly node: TransformNode;
-  readonly model: CharacterModel;
+  /** Центр капсулы: движение. */
+  readonly node = { position: new Vector3(0, 0, 0) };
   readonly elite: boolean;
   readonly gold: number;
+  /** Тинт спрайта (из статов) */
+  readonly tint: Color3;
+  /** Итоговый масштаб (рост = 2 × scale) */
+  readonly scale: number;
   alive = true;
 
   private hp: number;
@@ -142,12 +73,10 @@ export class Enemy {
   /** Замедление: множитель скорости, пока slowT > 0 */
   private slowMult = 1;
   private slowT = 0;
-  /** Вспышка от урона: остаток времени и материалы с исходным самосвечением */
+  /** Вспышка от урона: остаток времени */
   private flashT = 0;
-  private flashMats: { mat: StandardMaterial | PBRMaterial; base: Color3; albedo: Color3 }[] = [];
   /** Смещение центра капсулы над землёй (= половина роста) */
   private halfHeight: number;
-  private scale: number;
 
   // Индивидуальность в толпе
   private sideBias: number;
@@ -155,24 +84,16 @@ export class Enemy {
   private wanderFreq: number;
   private fanSign: number;
   private time = 0;
-  private motion: MotionState = {
-    moving: false,
-    speed: 0,
-    strafe: 0,
-    airborne: false,
-    vy: 0,
-    airTime: 0,
-    land: 0,
-    crouch: 0,
-    yawRate: 0,
-  };
+  /** Фаза шага для спрайт-анимации: растёт с фактической скоростью */
+  walkPhase = Math.random();
 
-  constructor(scene: Scene, model: CharacterModel, pos: Vector3, stats: EnemyStats) {
+  constructor(pos: Vector3, stats: EnemyStats) {
     this.hp = stats.hp;
     this.speed = stats.speed * (1 + SPEED_SPREAD * (Math.random() * 2 - 1));
     this.damage = stats.damage;
     this.gold = stats.gold;
     this.elite = stats.elite === true;
+    this.tint = stats.tint;
     this.scale = enemyScale(stats);
     this.halfHeight = (CHARACTER_HEIGHT / 2) * this.scale;
 
@@ -181,46 +102,17 @@ export class Enemy {
     this.wanderFreq = 0.5 + Math.random() * 0.8;
     this.fanSign = Math.random() < 0.5 ? -1 : 1;
 
-    this.node = new TransformNode("enemyRoot", scene);
     this.node.position.copyFrom(pos);
-    this.model = model;
-    model.root.parent = this.node;
-    model.root.position.set(0, -this.halfHeight, 0);
-
-    // Материалы — свои у каждого врага (клонированы при перекраске), можно мигать ими без оглядки на соседей
-    const seen = new Set<Material>();
-    const collect = (mat: Material | null) => {
-      if (!mat || seen.has(mat)) return;
-      seen.add(mat);
-      if (mat instanceof MultiMaterial) for (const s of mat.subMaterials) collect(s);
-      else if (mat instanceof StandardMaterial) {
-        mat.diffuseColor = ownColor(mat.diffuseColor, (c) => (mat.diffuseColor = c));
-        mat.emissiveColor = ownColor(mat.emissiveColor, (c) => (mat.emissiveColor = c));
-        this.flashMats.push({ mat, base: mat.emissiveColor.clone(), albedo: mat.diffuseColor.clone() });
-      } else if (mat instanceof PBRMaterial) {
-        mat.albedoColor = ownColor(mat.albedoColor, (c) => (mat.albedoColor = c));
-        mat.emissiveColor = ownColor(mat.emissiveColor, (c) => (mat.emissiveColor = c));
-        this.flashMats.push({ mat, base: mat.emissiveColor.clone(), albedo: mat.albedoColor.clone() });
-      }
-    };
-    for (const m of model.meshes) collect(m.material);
   }
 
-  /** Степень вспышки k ∈ [0,1]: самосвечение к красному, базовый цвет гасится, ореол через GlowLayer */
-  private setFlash(k: number): void {
-    for (const f of this.flashMats) {
-      Color3.LerpToRef(f.base, HIT_FLASH_COLOR, k, f.mat.emissiveColor);
-      const albedo = f.mat instanceof PBRMaterial ? f.mat.albedoColor : f.mat.diffuseColor;
-      Color3.LerpToRef(f.albedo, f.albedo.scale(HIT_FLASH_ALBEDO), k, albedo);
-    }
-    if (this.elite) return; // элита светится своим цветом всегда
-    for (const m of this.model.meshes) {
-      if (k > 0) {
-        m.metadata = { ...(m.metadata ?? {}), glow: [HIT_FLASH_GLOW[0] * k, HIT_FLASH_GLOW[1] * k, HIT_FLASH_GLOW[2] * k] };
-      } else if (m.metadata?.glow) {
-        delete m.metadata.glow;
-      }
-    }
+  /** Прогресс замаха 0..1 (0 — не атакует) — спрайт атаки */
+  get attackK(): number {
+    return this.windup > 0 ? 1 - this.windup / ATTACK_WINDUP : 0;
+  }
+
+  /** Степень вспышки урона 0..1 — подмешивание красного в тинт */
+  get flashK(): number {
+    return this.flashT > 0 ? this.flashT / HIT_FLASH_TIME : 0;
   }
 
   /** Замедлить: скорость × mult на seconds (повторное — продлевает, множитель берётся сильнейший) */
@@ -232,13 +124,6 @@ export class Enemy {
   /** Замедлен ли сейчас */
   get slowed(): boolean {
     return this.slowT > 0;
-  }
-
-  /** Вспышка красным: самосвечение материалов уходит к HIT_FLASH_COLOR и гаснет обратно */
-  private updateFlash(dt: number): void {
-    if (this.flashT <= 0) return;
-    this.flashT = Math.max(0, this.flashT - dt);
-    this.setFlash(this.flashT / HIT_FLASH_TIME);
   }
 
   /** Радиус капсулы (для попаданий) */
@@ -278,7 +163,7 @@ export class Enemy {
     this.time += dt;
     this.attackTimer = Math.max(0, this.attackTimer - dt);
     this.slowT = Math.max(0, this.slowT - dt);
-    this.updateFlash(dt);
+    this.flashT = Math.max(0, this.flashT - dt);
 
     const p = this.node.position;
     const dx = playerPos.x - p.x;
@@ -301,8 +186,6 @@ export class Enemy {
 
     const x0 = p.x;
     const z0 = p.z;
-    let faceX = dx;
-    let faceZ = dz;
 
     if (inRange && canReach) {
       if (this.attackTimer <= 0 && this.windup <= 0) {
@@ -339,36 +222,11 @@ export class Enemy {
       } else if (!blocked(p.x, nz + Math.sign(mz) * r)) {
         p.z = nz; // ...или по Z
       }
-      faceX = mx;
-      faceZ = mz;
-      // Вблизи смотрим на игрока, даже если обходим его
-      if (dist < SURROUND_DIST * 0.5) {
-        faceX = dx;
-        faceZ = dz;
-      }
     }
     p.y = getHeight(p.x, p.z) + this.halfHeight;
 
-    // Плавный поворот по кратчайшей дуге
-    if (faceX * faceX + faceZ * faceZ > 1e-6) {
-      const target = Math.atan2(faceX, faceZ);
-      let delta = target - this.node.rotation.y;
-      delta = Math.atan2(Math.sin(delta), Math.cos(delta));
-      this.node.rotation.y += delta * Math.min(1, dt * TURN_RATE);
-    }
-
-    // Анимация: по фактической скорости; вдалеке скелет не трогаем
-    if (dist < ANIM_DIST) {
-      const v = dt > 0 ? Math.hypot(p.x - x0, p.z - z0) / dt : 0;
-      const m = this.motion;
-      m.moving = v > 0.3;
-      m.speed = v / this.scale; // фаза шага — в «единицах роста», иначе маленькие ноги семенят слишком редко
-      // Выпад на ударе: модель уходит вперёд и возвращается
-      const lunge = this.windup > 0 ? Math.sin((1 - this.windup / ATTACK_WINDUP) * Math.PI) : 0;
-      this.model.root.position.z = lunge * LUNGE * this.scale;
-      m.crouch = lunge * 0.35;
-      this.model.update(dt, m);
-    }
+    // Фаза шага — по фактической скорости, в «единицах роста»
+    if (dt > 0) this.walkPhase += (Math.hypot(p.x - x0, p.z - z0) / dt / this.scale) * dt * 1.6;
 
     return dealt;
   }
@@ -382,13 +240,10 @@ export class Enemy {
     }
     // Вспышка сразу на пике — иначе при быстрой стрельбе кадр без подсветки не даст её заметить
     this.flashT = HIT_FLASH_TIME;
-    this.setFlash(1);
     return false;
   }
 
   kill(): void {
     this.alive = false;
-    this.model.dispose();
-    this.node.dispose();
   }
 }

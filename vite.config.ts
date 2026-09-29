@@ -24,12 +24,13 @@ function cleanRoutes(routes: Record<string, string>): Plugin {
 }
 
 export default defineConfig({
-  plugins: [cleanRoutes({ "/viewer": "/viewer.html" })],
+  plugins: [cleanRoutes({ "/viewer": "/viewer.html", "/raytrace": "/raytrace.html" })],
   build: {
     rollupOptions: {
       input: {
         main: "index.html",
         viewer: "viewer.html",
+        raytrace: "raytrace.html",
       },
     },
   },

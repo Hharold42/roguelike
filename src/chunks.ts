@@ -5,6 +5,7 @@ import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { Scene } from "@babylonjs/core/scene";
 import { Terrain, chunkKey } from "./terrain";
 import { buildChunkMeshes, type ChunkMeshes } from "./terrainMesh";
+import { makeConcreteTexture } from "./pixelTextures";
 
 /** Радиус (в чанках) вокруг игрока, в котором чанки загружены: 2 -> 5x5 = 160x160 юнитов */
 const LOAD_RADIUS = 2;
@@ -36,7 +37,10 @@ export class ChunkManager {
     this.groundMat.specularColor = Color3.Black();
 
     this.wallMat = new StandardMaterial("wallMat", scene);
-    this.wallMat.diffuseColor = new Color3(0.5, 0.48, 0.56);
+    // Панельный бетон 64×64 (процедурный, NEAREST); цвет — в текстуре,
+    // инстанс-оттенок по высоте блока по-прежнему перемножается сверху
+    this.wallMat.diffuseTexture = makeConcreteTexture(scene);
+    this.wallMat.diffuseColor = Color3.White();
     this.wallMat.specularColor = Color3.Black();
   }
 

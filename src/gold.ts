@@ -1,13 +1,6 @@
-import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
-import type { InstancedMesh } from "@babylonjs/core/Meshes/instancedMesh";
-import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
-import { CreatePolyhedron } from "@babylonjs/core/Meshes/Builders/polyhedronBuilder";
-import type { Scene } from "@babylonjs/core/scene";
 import type { HeightFn } from "./player";
+
 const COIN_SIZE = 0.16;
 const MAX_COINS_PER_DROP = 5; // крупная сумма падает несколькими монетами, но не сотней
 const GRAVITY = 22;
@@ -19,12 +12,10 @@ const MAGNET_MAX = 18;
 const PICK_DIST = 0.75;
 const LIFETIME = 25; // с, потом исчезает
 const SPIN = 3.2; // рад/с
-const COUPON_COLOR = new Color3(0.45, 1, 0.55);
 
-type PickupKind = "gold" | "coupon";
+export type PickupKind = "gold" | "coupon";
 
-interface Coin {
-  mesh: InstancedMesh;
+export interface Coin {
   kind: PickupKind;
   pos: Vector3;
   vel: Vector3;
@@ -33,52 +24,24 @@ interface Coin {
   /** Летит к игроку */
   magnet: boolean;
   floor: number;
+  /** Угол вращения (кадр спрайта) */
+  spin: number;
+  /** Масштаб спрайта (крупная монета — больше) */
+  size: number;
 }
 
 /**
- * Золото: монеты-инстансы одного октаэдра. Выпадают из врага, подпрыгивают, ложатся на землю,
- * рядом с игроком притягиваются и подбираются. Один draw call на все монеты.
- * Той же физикой падают и купоны колеса (зелёные билеты, не исчезают со временем).
+ * Золото: монеты — чистые данные (позиция, скорость), рисует их софтверный рендер спрайтами.
+ * Выпадают из врага, подпрыгивают, ложатся на землю, рядом с игроком притягиваются и подбираются.
+ * Той же физикой падают и купоны колеса (не исчезают со временем).
  */
 export class GoldPool {
-  private source: Mesh;
-  private couponSource: Mesh;
-  private coins: Coin[] = [];
-  private free: InstancedMesh[] = [];
-  private freeCoupons: InstancedMesh[] = [];
+  /** Живые монеты и купоны — рендер читает напрямую */
+  readonly coins: Coin[] = [];
   /** Радиус притяжения монет к игроку */
   magnetDist = MAGNET_DIST;
   /** Подобранные купоны, ещё не забранные игрой (`takeCoupons`) */
   private coupons = 0;
-
-  constructor(scene: Scene) {
-    const mat = new StandardMaterial("goldMat", scene);
-    mat.diffuseColor = new Color3(1, 0.8, 0.2);
-    mat.emissiveColor = new Color3(0.9, 0.62, 0.1);
-    mat.specularColor = new Color3(1, 1, 0.8);
-    this.source = CreatePolyhedron("gold", { type: 1, size: COIN_SIZE }, scene);
-    this.source.material = mat;
-    this.source.isVisible = false;
-    this.source.isPickable = false;
-    this.source.metadata = { gold: true }; // GlowLayer подсвечивает
-    this.source.registerInstancedBuffer(VertexBuffer.ColorKind, 4);
-    this.source.instancedBuffers[VertexBuffer.ColorKind] = new Color4(1, 1, 1, 1);
-
-    const cmat = new StandardMaterial("couponMat", scene);
-    cmat.diffuseColor = COUPON_COLOR.scale(0.5);
-    cmat.emissiveColor = COUPON_COLOR.scale(0.7);
-    cmat.specularColor = Color3.Black();
-    this.couponSource = CreateBox("coupon", { width: 0.44, height: 0.04, depth: 0.26 }, scene);
-    this.couponSource.material = cmat;
-    this.couponSource.isVisible = false;
-    this.couponSource.isPickable = false;
-    this.couponSource.metadata = { glow: [COUPON_COLOR.r, COUPON_COLOR.g, COUPON_COLOR.b] };
-  }
-
-  /** Меш-источник для теней (инстансы рисуются вместе с ним) */
-  get shadowCaster(): Mesh {
-    return this.source;
-  }
 
   /** Во сколько раз радиус притяжения больше базового (для HUD) */
   get magnetMult(): number {
@@ -94,27 +57,13 @@ export class GoldPool {
     for (let i = 0; i < n; i++) {
       const value = base + (rest > 0 ? 1 : 0);
       if (rest > 0) rest--;
-      let mesh = this.free.pop();
-      if (!mesh) {
-        mesh = this.source.createInstance("goldCoin");
-        mesh.isPickable = false;
-      }
-      // Крупная монета — чуть больше и ярче
-      const s = 1 + 0.25 * Math.min(3, value - 1);
-      mesh.scaling.setAll(s);
-      mesh.instancedBuffers[VertexBuffer.ColorKind] = value > 1 ? new Color4(1, 0.95, 0.6, 1) : new Color4(1, 0.85, 0.35, 1);
-      this.drop(mesh, "gold", value, at, floor);
+      this.drop("gold", value, at, floor);
     }
   }
 
   /** Выпадение купона колеса фортуны */
   spawnCoupon(at: Vector3, floor: number): void {
-    let mesh = this.freeCoupons.pop();
-    if (!mesh) {
-      mesh = this.couponSource.createInstance("couponTicket");
-      mesh.isPickable = false;
-    }
-    this.drop(mesh, "coupon", 1, at, floor);
+    this.drop("coupon", 1, at, floor);
   }
 
   /** Забрать подобранные купоны (обнуляет счётчик) */
@@ -124,14 +73,12 @@ export class GoldPool {
     return n;
   }
 
-  private drop(mesh: InstancedMesh, kind: PickupKind, value: number, at: Vector3, floor: number): void {
-    mesh.setEnabled(true);
+  private drop(kind: PickupKind, value: number, at: Vector3, floor: number): void {
     const a = Math.random() * Math.PI * 2;
     const h = 1.5 + Math.random() * 2;
     const pos = at.clone();
     pos.y += 0.2;
     this.coins.push({
-      mesh,
       kind,
       pos,
       vel: new Vector3(Math.cos(a) * h, POP_SPEED * (0.8 + Math.random() * 0.5), Math.sin(a) * h),
@@ -139,6 +86,8 @@ export class GoldPool {
       age: 0,
       magnet: false,
       floor,
+      spin: Math.random() * Math.PI * 2,
+      size: kind === "gold" ? 1 + 0.25 * Math.min(3, value - 1) : 1,
     });
   }
 
@@ -148,6 +97,7 @@ export class GoldPool {
     for (let i = this.coins.length - 1; i >= 0; i--) {
       const c = this.coins[i];
       c.age += dt;
+      c.spin += SPIN * dt;
       const dx = playerPos.x - c.pos.x;
       const dy = playerPos.y - 0.3 - c.pos.y; // к поясу
       const dz = playerPos.z - c.pos.z;
@@ -160,7 +110,7 @@ export class GoldPool {
         if (d < PICK_DIST) {
           if (c.kind === "gold") collected += c.value;
           else this.coupons += c.value;
-          this.release(i);
+          this.coins.splice(i, 1);
           continue;
         }
         // Разгон к игроку, старую скорость гасим
@@ -184,22 +134,13 @@ export class GoldPool {
           }
         }
         if (c.kind === "gold" && c.age > LIFETIME) {
-          this.release(i); // купоны не исчезают
+          this.coins.splice(i, 1); // купоны не исчезают
           continue;
         }
       }
-      c.mesh.position.copyFrom(c.pos);
-      c.mesh.rotation.y += SPIN * dt;
-      // Лежащая монета чуть подпрыгивает-«дышит», чтобы читалась
-      if (!c.magnet && c.vel.lengthSquared() < 1e-4) c.mesh.position.y += 0.04 * Math.sin(c.age * 4 + c.mesh.uniqueId);
+      // Лежащая монета чуть «дышит», чтобы читалась
+      c.floor = getFloor(c.pos.x, c.pos.z);
     }
     return collected;
-  }
-
-  private release(i: number): void {
-    const c = this.coins[i];
-    c.mesh.setEnabled(false);
-    (c.kind === "gold" ? this.free : this.freeCoupons).push(c.mesh);
-    this.coins.splice(i, 1);
   }
 }

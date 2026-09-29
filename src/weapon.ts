@@ -1,9 +1,4 @@
-import { Color3 } from "@babylonjs/core/Maths/math.color";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { CreateDisc } from "@babylonjs/core/Meshes/Builders/discBuilder";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
-import type { Scene } from "@babylonjs/core/scene";
 import type { Enemy } from "./enemy";
 import { lerp } from "./mathUtil";
 import type { ProjectilePool } from "./projectiles";
@@ -19,14 +14,13 @@ const RECOVER_MAX = 2.0; // ...и при максимальном
 const MULTI_FAN_DEG = 5; // веер при улучшении «доп. снаряды»
 
 // --- Меч ---
-const SWORD_RANGE = 2.6; // радиус удара от центра игрока
+export const SWORD_RANGE = 2.6; // радиус удара от центра игрока
 const SWORD_ARC_DEG = 130; // ширина сектора по умолчанию
 const SWORD_HEIGHT = 1.6; // допустимая разница высот ступней
 const SWORD_DAMAGE_MULT = 3; // урон взмаха = урон снаряда × это
 const SWING_TIME = 0.14; // длительность одного взмаха, с
 const SWING_GAP = 0.04; // пауза между взмахами серии
 const SWING_HALF = 1.1; // амплитуда руки, рад (взмах идёт от -A до +A)
-const ARC_LIFE = 0.22; // визуал сектора, с
 
 export const CRIT_MULT = 3;
 
@@ -250,6 +244,8 @@ export interface MeleeHooks {
   onKill: (enemy: Enemy) => void;
   /** Рывок игрока вперёд на distance перед ударом (перк «Рывок-удар»); Game проверяет стены */
   dash?: (distance: number) => void;
+  /** Визуал взмаха: сектор на земле (центр, курс, ширина дуги) — рисует рендер */
+  onArc?: (x: number, y: number, z: number, yaw: number, arc: number) => void;
 }
 
 /** Модификации меча из магазина/крафта */
@@ -286,13 +282,6 @@ interface Series {
   hit: boolean;
 }
 
-/** Сектор удара на земле; у каждого свой материал — гаснут независимо */
-interface Arc {
-  mesh: Mesh;
-  mat: StandardMaterial;
-  life: number;
-}
-
 const SWING_STEP = 1.6; // на сколько каждый следующий взмах серии дальше предыдущего
 
 /**
@@ -303,9 +292,7 @@ const SWING_STEP = 1.6; // на сколько каждый следующий �
 export class Sword extends Weapon {
   private series: Series[] = [];
   private nextDir: 1 | -1 = 1;
-  private arm = 0; // сглаженный угол руки для анимации
-  private arcs: Arc[] = [];
-  private freeArcs: Arc[] = [];
+  private arm = 0; // сглаженный угол руки для анимации вьюмодели
   private readonly rootCooldown: number;
   title = "Меч";
   arc = (SWORD_ARC_DEG * Math.PI) / 180;
@@ -313,7 +300,6 @@ export class Sword extends Weapon {
   dash = 0;
 
   constructor(
-    private scene: Scene,
     stats: WeaponStats,
     baseCooldown: number,
     private hooks: MeleeHooks,
@@ -329,10 +315,6 @@ export class Sword extends Weapon {
     if (m.damageMult !== undefined) this.damageMult *= m.damageMult;
     if (m.cooldownMult !== undefined) this.baseCooldown *= m.cooldownMult;
     if (m.dash !== undefined) this.dash = m.dash;
-    // Секторы визуала перестраиваются под новый угол
-    for (const a of [...this.arcs, ...this.freeArcs]) a.mesh.dispose();
-    this.arcs.length = 0;
-    this.freeArcs.length = 0;
   }
 
   get arcDeg(): number {
@@ -417,18 +399,6 @@ export class Sword extends Weapon {
     const want = active ? active.dir * lerp(-SWING_HALF, SWING_HALF, ease(active.t)) : 0;
     const rate = active ? 40 : 14;
     this.arm += (want - this.arm) * Math.min(1, dt * rate);
-
-    // Секторы гаснут
-    for (let i = this.arcs.length - 1; i >= 0; i--) {
-      const a = this.arcs[i];
-      a.life -= dt;
-      a.mat.alpha = 0.35 * Math.max(0, a.life / ARC_LIFE);
-      if (a.life <= 0) {
-        a.mesh.setEnabled(false);
-        this.freeArcs.push(a);
-        this.arcs.splice(i, 1);
-      }
-    }
   }
 
   /** Урон всем врагам в секторе текущего взмаха серии */
@@ -450,7 +420,8 @@ export class Sword extends Weapon {
     const cosHalf = Math.cos(this.arc / 2);
     const base = this.swingDamage;
 
-    this.showArc(o.x, feet + 0.07, o.z, s.yaw);
+    // Визуал сектора — рендер (кольцо-дуга на земле)
+    this.hooks.onArc?.(o.x, feet + 0.07, o.z, s.yaw, this.arc);
 
     for (const e of this.hooks.enemies()) {
       if (!e.alive) continue;
@@ -466,33 +437,6 @@ export class Sword extends Weapon {
       this.hooks.onHit(e, dmg, new Vector3(p.x, p.y, p.z), this.stats.thunderBlade);
       if (e.alive && e.takeDamage(dmg)) this.hooks.onKill(e);
     }
-  }
-
-  /**
-   * Сектор на земле, центр по yaw. Диск после rotation.x=π/2 лежит в XZ, его сектор
-   * начинается с +X в сторону +Z; rotation.y поворачивает так, чтобы середина легла на направление yaw.
-   */
-  private showArc(x: number, y: number, z: number, yaw: number): void {
-    let a = this.freeArcs.pop();
-    if (!a) {
-      const mat = new StandardMaterial("swordArcMat", this.scene);
-      mat.diffuseColor = Color3.Black();
-      mat.specularColor = Color3.Black();
-      mat.emissiveColor = new Color3(0.75, 0.9, 1);
-      mat.disableLighting = true;
-      mat.backFaceCulling = false;
-      const mesh = CreateDisc("swordArc", { radius: SWORD_RANGE, arc: Math.min(1, this.arc / (Math.PI * 2)), tessellation: 32 }, this.scene);
-      mesh.material = mat;
-      mesh.isPickable = false;
-      mesh.receiveShadows = false;
-      a = { mesh, mat, life: 0 };
-    }
-    a.mesh.position.set(x, y, z);
-    a.mesh.rotation.set(Math.PI / 2, this.arc / 2 - Math.PI / 2 + yaw, 0);
-    a.mesh.setEnabled(true);
-    a.mat.alpha = 0.35;
-    a.life = ARC_LIFE;
-    this.arcs.push(a);
   }
 
   override reset(): void {

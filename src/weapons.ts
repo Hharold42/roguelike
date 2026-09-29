@@ -1,22 +1,19 @@
-import { Color3 } from "@babylonjs/core/Maths/math.color";
-import { Quaternion, Vector3 } from "@babylonjs/core/Maths/math.vector";
-import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { CreateDisc } from "@babylonjs/core/Meshes/Builders/discBuilder";
-import { CreateLines } from "@babylonjs/core/Meshes/Builders/linesBuilder";
-import { CreateTorus } from "@babylonjs/core/Meshes/Builders/torusBuilder";
-import type { LinesMesh } from "@babylonjs/core/Meshes/linesMesh";
-import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
-import type { TransformNode } from "@babylonjs/core/Meshes/transformNode";
-import type { Scene } from "@babylonjs/core/scene";
-import { buildGunMesh, GUN_MUZZLE_LOCAL } from "./characterModel";
-import { gunTemplate } from "./weaponModel";
+import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import type { Enemy } from "./enemy";
-import { lookRotation } from "./mathUtil";
 import type { Player } from "./player";
 import type { ProjectilePool } from "./projectiles";
 import { Gun, GUN_PRESETS } from "./weapon";
-import { BlastFx, Boomerang, Mortar, OrbitBlades, type AutoHooks } from "./autoWeapons";
+import {
+  Boomerang,
+  Mortar,
+  OrbitBlades,
+  type AutoHooks,
+  type BladePos,
+  type BoomerangFlight,
+  type FxSink,
+  type IonField,
+  type Shell,
+} from "./autoWeapons";
 
 /** Оружия колеса/магазина + результаты крафта (saw — Пила) */
 export type WeaponId = "drone" | "boomerang" | "blades" | "mortar" | "lightning" | "radiance" | "saw";
@@ -62,7 +59,6 @@ const LIGHTNING_CHANCE = 0.3;
 const LIGHTNING_JUMPS = 2;
 const LIGHTNING_RANGE = 8; // от поражённого врага
 const LIGHTNING_DAMAGE_MULT = 1; // доля урона пули
-const BOLT_LIFE = 0.18; // с, визуал
 const BOLT_SEGMENTS = 7;
 const BOLT_JAG = 0.35;
 
@@ -76,15 +72,10 @@ const RADIANCE_MISS_MULT = 0.1; // урон врага при промахе
 const CORE_RADIUS = 9;
 const CORE_MISS_CHANCE = 0.5;
 
-interface Bolt {
-  mesh: LinesMesh;
-  life: number;
-}
-
-interface Drone {
-  root: TransformNode;
-  meshes: AbstractMesh[];
-  muzzle: Vector3;
+export interface Drone {
+  pos: Vector3;
+  /** Сглаженное направление ствола (для точки вылета пуль) */
+  dir: Vector3;
   gun: Gun;
   offset: Vector3;
   phase: number;
@@ -94,6 +85,7 @@ interface Drone {
  * Выигранные оружия и их логика: летающий пистолет, бумеранг, клинки, мортира, молния по попаданиям,
  * аура Radiance. Урон врагам наносит через переданные колбэки, чтобы золото и статистика считались в одном месте.
  * Крафт превращает оружия в улучшенные версии (Рой, Пила, Ядро, Ионная пушка) — те же объекты с другими параметрами.
+ * Визуал — софтверный рендер: дроны/клинки/снаряды читаются как позиции, взрывы и молнии уходят в FxSink.
  */
 export class WeaponSystem {
   /** Что уже выиграно (порядок — порядок получения) */
@@ -104,31 +96,24 @@ export class WeaponSystem {
   private boomerang: Boomerang | null = null;
   private blades: OrbitBlades | null = null;
   private mortar: Mortar | null = null;
-  private fx: BlastFx;
   /** Враги последнего кадра — для молнии из автоматических оружий */
   private enemies: Enemy[] = [];
 
-  private drones: Drone[] = [];
+  /** Дроны — рендер читает позиции */
+  readonly drones: Drone[] = [];
   private droneTime = 0;
 
-  private bolts: Bolt[] = [];
-  private freeBolts: LinesMesh[] = [];
-
-  private aura: Mesh | null = null;
-  private auraMat: StandardMaterial | null = null;
   private radianceTimer = 0;
   private radianceRadius = RADIANCE_RADIUS;
   private radianceMiss = RADIANCE_MISS_CHANCE;
   private time = 0;
 
   constructor(
-    private scene: Scene,
     private projectiles: ProjectilePool,
     private onKill: (enemy: Enemy) => void,
     private floorAt: (x: number, z: number) => number,
-  ) {
-    this.fx = new BlastFx(scene);
-  }
+    private fx: FxSink,
+  ) {}
 
   has(id: WeaponId): boolean {
     return this.owned.includes(id);
@@ -167,20 +152,19 @@ export class WeaponSystem {
         this.createDrones(player, 1);
         break;
       case "boomerang":
-        this.boomerang = new Boomerang(this.scene, player.weaponStats, this.hooks());
+        this.boomerang = new Boomerang(player.weaponStats, this.hooks());
         break;
       case "blades":
-        this.blades = new OrbitBlades(this.scene, player.weaponStats, this.hooks());
+        this.blades = new OrbitBlades(player.weaponStats, this.hooks());
         break;
       case "mortar":
-        this.mortar = new Mortar(this.scene, player.weaponStats, this.hooks(), this.fx);
+        this.mortar = new Mortar(player.weaponStats, this.hooks(), this.fx);
         break;
       case "radiance":
-        this.createAura();
         break;
       case "saw":
-        this.blades = new OrbitBlades(this.scene, player.weaponStats, this.hooks(), { baseCount: 4, radius: 4 });
-        this.boomerang = new Boomerang(this.scene, player.weaponStats, this.hooks(), { color: new Color3(0.45, 0.85, 1), cooldownMult: 1.4 });
+        this.blades = new OrbitBlades(player.weaponStats, this.hooks(), { baseCount: 4, radius: 4 });
+        this.boomerang = new Boomerang(player.weaponStats, this.hooks(), { cooldownMult: 1.4 });
         break;
       case "lightning":
         break;
@@ -188,7 +172,7 @@ export class WeaponSystem {
     return true;
   }
 
-  /** Забрать оружие (продажа, перековка, ингредиент крафта): меши убираются */
+  /** Забрать оружие (продажа, перековка, ингредиент крафта) */
   revoke(id: WeaponId): boolean {
     const i = this.owned.indexOf(id);
     if (i < 0) return false;
@@ -196,30 +180,22 @@ export class WeaponSystem {
     this.titles.delete(id);
     switch (id) {
       case "drone":
-        this.disposeDrones();
+        this.drones.length = 0;
         break;
       case "boomerang":
-        this.boomerang?.dispose();
         this.boomerang = null;
         break;
       case "blades":
-        this.blades?.dispose();
         this.blades = null;
         break;
       case "saw":
-        this.blades?.dispose();
         this.blades = null;
-        this.boomerang?.dispose();
         this.boomerang = null;
         break;
       case "mortar":
-        this.mortar?.dispose();
         this.mortar = null;
         break;
       case "radiance":
-        this.aura?.dispose(false, true);
-        this.aura = null;
-        this.auraMat = null;
         this.radianceRadius = RADIANCE_RADIUS;
         this.radianceMiss = RADIANCE_MISS_CHANCE;
         break;
@@ -234,17 +210,16 @@ export class WeaponSystem {
   /** Рой: летающий пистолет → три дрона с уроном ×0.6 */
   makeSwarm(player: Player): void {
     if (!this.has("drone")) return;
-    this.disposeDrones();
+    this.drones.length = 0;
     this.createDrones(player, SWARM_COUNT);
     this.titles.set("drone", "Рой");
   }
 
   /** Ядро: Radiance радиусом 9, промах врагов 50 % */
   makeCore(): void {
-    if (!this.aura) return;
+    if (!this.has("radiance")) return;
     this.radianceRadius = CORE_RADIUS;
     this.radianceMiss = CORE_MISS_CHANCE;
-    this.aura.scaling.setAll(CORE_RADIUS / RADIANCE_RADIUS);
     this.titles.set("radiance", "Ядро");
   }
 
@@ -261,13 +236,35 @@ export class WeaponSystem {
   }
 
   /** Кольцо взрыва на земле (бомба из магазина и т. п.) */
-  blast(at: Vector3, radius: number, color = new Color3(1, 0.85, 0.3)): void {
-    this.fx.show(at.x, at.y, at.z, radius, color);
+  blast(at: Vector3, radius: number, rgb: [number, number, number] = [1, 0.85, 0.3]): void {
+    this.fx.blast(at.x, at.y, at.z, radius, rgb[0], rgb[1], rgb[2]);
   }
 
-  /** Меши для теней (появляются при получении) */
-  get shadowCasters(): AbstractMesh[] {
-    return this.drones.flatMap((d) => d.meshes);
+  // --- Позиции для рендера ---
+
+  /** Радиус ауры Radiance (null — ауры нет) */
+  get auraRadius(): number | null {
+    return this.has("radiance") ? this.radianceRadius : null;
+  }
+
+  /** Полёты бумерангов (null — оружия нет) */
+  get boomerangFlights(): readonly BoomerangFlight[] | null {
+    return this.boomerang?.flights ?? null;
+  }
+
+  /** Позиции орбитальных клинков (null — оружия нет) */
+  get bladePositions(): readonly BladePos[] | null {
+    return this.blades?.positions ?? null;
+  }
+
+  /** Снаряды мортиры в полёте (null — оружия нет) */
+  get mortarShells(): readonly Shell[] | null {
+    return this.mortar?.shells ?? null;
+  }
+
+  /** Ионные поля (null — оружия нет) */
+  get ionFields(): readonly IonField[] | null {
+    return this.mortar?.fields ?? null;
   }
 
   update(dt: number, player: Player, enemies: Enemy[]): void {
@@ -277,18 +274,7 @@ export class WeaponSystem {
     this.boomerang?.update(dt, player, enemies);
     this.blades?.update(dt, player, enemies);
     this.mortar?.update(dt, player, enemies);
-    this.fx.update(dt);
-    if (this.aura) this.updateRadiance(dt, player, enemies);
-    for (let i = this.bolts.length - 1; i >= 0; i--) {
-      const b = this.bolts[i];
-      b.life -= dt;
-      b.mesh.alpha = Math.max(0, b.life / BOLT_LIFE);
-      if (b.life <= 0) {
-        b.mesh.setEnabled(false);
-        this.freeBolts.push(b.mesh);
-        this.bolts.splice(i, 1);
-      }
-    }
+    if (this.has("radiance")) this.updateRadiance(dt, player, enemies);
   }
 
   /**
@@ -313,7 +299,7 @@ export class WeaponSystem {
 
   /** Урон, который враг наносит игроку, с учётом Radiance (промах — 10 %) */
   incomingDamage(enemy: Enemy, damage: number, player: Player): number {
-    if (!this.aura) return damage;
+    if (!this.has("radiance")) return damage;
     const d2 = Vector3.DistanceSquared(enemy.node.position, player.position);
     if (d2 <= this.radianceRadius * this.radianceRadius && Math.random() < this.radianceMiss) return damage * RADIANCE_MISS_MULT;
     return damage;
@@ -323,18 +309,12 @@ export class WeaponSystem {
 
   private createDrones(player: Player, count: number): void {
     for (let i = 0; i < count; i++) {
-      // Та же модель, что в руке (если файл загружен), иначе примитивы с голубым стволом
-      const template = gunTemplate(this.scene);
-      const gun = template ? template.instantiate(`drone${i}`) : buildGunMesh(this.scene, `drone${i}`, new Color3(0.35, 0.85, 1));
-      if (!gun.root.rotationQuaternion) gun.root.rotationQuaternion = Quaternion.Identity();
-      gun.root.scaling.setAll(count > 1 ? 1.0 : 1.3); // одиночный чуть крупнее ручного — чтобы читался в воздухе
       // Автоматика не греется: разброс остаётся минимальным
       const weapon = new Gun(this.projectiles, player.weaponStats, { baseCooldown: DRONE_COOLDOWN, heat: false });
       if (count > 1) weapon.applyPreset({ ...GUN_PRESETS.pistol, damageMult: SWARM_DAMAGE_MULT });
       this.drones.push({
-        root: gun.root,
-        meshes: gun.meshes,
-        muzzle: "muzzleLocal" in gun ? gun.muzzleLocal : GUN_MUZZLE_LOCAL,
+        pos: player.position.clone(),
+        dir: new Vector3(0, 0, 1),
         gun: weapon,
         offset: count > 1 ? SWARM_OFFSETS[i % SWARM_OFFSETS.length] : DRONE_OFFSET,
         phase: (i / count) * Math.PI * 2,
@@ -342,14 +322,9 @@ export class WeaponSystem {
     }
   }
 
-  private disposeDrones(): void {
-    for (const d of this.drones) d.root.dispose(false, true);
-    this.drones.length = 0;
-  }
-
   private updateDrones(dt: number, player: Player, enemies: Enemy[]): void {
     this.droneTime += dt;
-    const yaw = player.mesh.rotation.y;
+    const yaw = player.yaw;
     const sy = Math.sin(yaw);
     const cy = Math.cos(yaw);
     for (const d of this.drones) {
@@ -362,30 +337,30 @@ export class WeaponSystem {
         player.position.y + d.offset.y + 0.08 * Math.sin(this.droneTime * 2.3 + d.phase),
         player.position.z + oz,
       );
-      if (Vector3.DistanceSquared(d.root.position, want) > 25) d.root.position.copyFrom(want);
-      else d.root.position.addInPlace(want.subtract(d.root.position).scaleInPlace(Math.min(1, dt * DRONE_FOLLOW)));
+      if (Vector3.DistanceSquared(d.pos, want) > 25) d.pos.copyFrom(want);
+      else d.pos.addInPlace(want.subtract(d.pos).scaleInPlace(Math.min(1, dt * DRONE_FOLLOW)));
 
       // Цель — ближайший живой враг в радиусе
       let target: Enemy | null = null;
       let best = DRONE_RANGE * DRONE_RANGE;
       for (const e of enemies) {
         if (!e.alive) continue;
-        const d2 = Vector3.DistanceSquared(e.node.position, d.root.position);
+        const d2 = Vector3.DistanceSquared(e.node.position, d.pos);
         if (d2 < best) {
           best = d2;
           target = e;
         }
       }
-      // Поворот: на цель, иначе — куда смотрит игрок
-      const dir = target ? target.node.position.subtract(d.root.position) : new Vector3(sy, 0, cy);
+      // Поворот ствола: на цель, иначе — куда смотрит игрок
+      const dir = target ? target.node.position.subtract(d.pos) : new Vector3(sy, 0, cy);
       if (dir.lengthSquared() > 1e-6) {
-        const wantRot = lookRotation(dir.normalize(), Vector3.Up());
-        Quaternion.SlerpToRef(d.root.rotationQuaternion!, wantRot, Math.min(1, dt * DRONE_TURN), d.root.rotationQuaternion!);
+        dir.normalize();
+        d.dir.addInPlace(dir.subtract(d.dir).scaleInPlace(Math.min(1, dt * DRONE_TURN)));
+        d.dir.normalize();
       }
 
       if (target && d.gun.ready) {
-        d.root.computeWorldMatrix(true);
-        const muzzle = Vector3.TransformCoordinates(d.muzzle, d.root.getWorldMatrix());
+        const muzzle = d.pos.add(d.dir.scale(0.5));
         d.gun.tryFire(muzzle, target.node.position);
       }
     }
@@ -409,55 +384,12 @@ export class WeaponSystem {
       }
       points.push(p);
     }
-    let mesh = this.freeBolts.pop();
-    if (mesh) {
-      mesh = CreateLines("bolt", { points, instance: mesh });
-      mesh.setEnabled(true);
-    } else {
-      mesh = CreateLines("bolt", { points, updatable: true }, this.scene);
-      mesh.color = new Color3(0.6, 0.9, 1);
-      mesh.isPickable = false;
-    }
-    mesh.alpha = 1;
-    this.bolts.push({ mesh, life: BOLT_LIFE });
+    this.fx.bolt(points.map((p) => ({ x: p.x, y: p.y, z: p.z })));
   }
 
   // ---------- Radiance ----------
 
-  private createAura(): void {
-    const glowMat = (name: string, alpha: number) => {
-      const mat = new StandardMaterial(name, this.scene);
-      mat.diffuseColor = Color3.Black();
-      mat.specularColor = Color3.Black();
-      mat.emissiveColor = new Color3(1, 0.45, 0.12);
-      mat.alpha = alpha;
-      mat.disableLighting = true;
-      mat.backFaceCulling = false;
-      return mat;
-    };
-    // Едва заметная заливка + яркое кольцо по границе радиуса
-    const fill = CreateDisc("radiance", { radius: RADIANCE_RADIUS, tessellation: 48 }, this.scene);
-    fill.rotation.x = Math.PI / 2;
-    fill.material = glowMat("radianceFillMat", 0.07);
-    const ring = CreateTorus("radianceRing", { diameter: RADIANCE_RADIUS * 2, thickness: 0.12, tessellation: 64 }, this.scene);
-    ring.material = glowMat("radianceRingMat", 0.6);
-    ring.metadata = { gold: true }; // тёплое свечение через GlowLayer
-    ring.parent = fill;
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.z = -0.02;
-    for (const m of [fill, ring]) {
-      m.isPickable = false;
-      m.receiveShadows = false;
-    }
-    this.aura = fill;
-    this.auraMat = ring.material as StandardMaterial;
-  }
-
   private updateRadiance(dt: number, player: Player, enemies: Enemy[]): void {
-    const aura = this.aura!;
-    aura.position.set(player.position.x, player.position.y - 1 + 0.08, player.position.z);
-    this.auraMat!.alpha = 0.5 + 0.15 * Math.sin(this.time * 3);
-
     this.radianceTimer -= dt;
     if (this.radianceTimer > 0) return;
     this.radianceTimer = RADIANCE_TICK;

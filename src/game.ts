@@ -1,22 +1,13 @@
-import { Engine } from "@babylonjs/core/Engines/engine";
-import { Scene } from "@babylonjs/core/scene";
-import type { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
-import type { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
-import { GlowLayer } from "@babylonjs/core/Layers/glowLayer";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color3 } from "@babylonjs/core/Maths/math.color";
-import "@babylonjs/core/Collisions/collisionCoordinator";
-import "@babylonjs/core/Culling/ray";
 
 import { Terrain } from "./terrain";
-import { ChunkManager } from "./chunks";
-import { Player } from "./player";
-import { createPlayerModel, PLAYER_MODEL_URL, type CharacterModel, type HeldWeapon } from "./characterModel";
-import { EnemyFactory, type Enemy, type EnemyStats } from "./enemy";
+import { Player, PLAYER_RADIUS } from "./player";
+import { Enemy, type EnemyStats } from "./enemy";
 import { CrowdSeparator } from "./crowd";
 import { GoldPool } from "./gold";
 import { WEAPONS, WeaponSystem, type WeaponDef, type WeaponId } from "./weapons";
-import { Gun, Sword, type Weapon } from "./weapon";
+import { Gun, Sword, SWORD_RANGE, type Weapon } from "./weapon";
 import {
   AEGIS_RECHARGE,
   COOLING_TIME,
@@ -37,20 +28,39 @@ import { ProjectilePool } from "./projectiles";
 import { Input } from "./input";
 import { FlowField } from "./flowField";
 import { rollUpgrades, UPGRADE_POOL } from "./upgrades";
-import { ThirdPersonCamera } from "./thirdPersonCamera";
-import { setupLighting, setupPostFx, setupShadows, setupSky } from "./environment";
+import { planForStage, type ObjectivePlan } from "./objectives";
+import { segmentSegmentDistance } from "./mathUtil";
+import type { HeldWeapon } from "./characterModel";
+import { ColumnMap } from "./soft/columnMap";
+import { SoftRenderer } from "./soft/renderer";
+import {
+  BEACON_BEAM,
+  BLADE_FRAMES,
+  BOOMERANG_FRAMES,
+  COIN_FRAMES,
+  COUPON,
+  DRONE,
+  ENEMY_ATTACK,
+  ENEMY_FRAMES,
+  GUN_VIEW,
+  MUZZLE_FLASH,
+  SHELL,
+  SWORD_IDLE,
+  SWORD_SWING0,
+  SWORD_SWING1,
+} from "./soft/sprites";
 
 const STAGE_DURATION = 30; // секунд на этап; по истечении — пауза и выбор улучшения
-const MAX_ALIVE = 160; // предохранитель: каждый враг — свой скиннованный меш, толпа больше не бесплатна
-const SPAWNS_PER_FRAME = 2; // клон модели стоит пару миллисекунд — толпу выпускаем порциями
+const MAX_ALIVE = 160; // предохранитель: логика толпы — это CPU, дальше растёт только цена кадра
+const SPAWNS_PER_FRAME = 8; // спрайт врага создаётся даром — очередь разгребаем быстро
 const BOSS_STAGE_EVERY = 10; // каждый кратный этап — штурм
 const BOSS_CROWD_MULT = 4; // толпа на штурме во столько раз больше
 const ELITE_EVERY = 10; // каждый N-й враг штурмовой толпы — элитный
-const ENEMY_SHADOWS = true; // тени от врагов (второй скиннованный проход на каждого)
 const SPAWN_MIN_DIST = 26; // враги появляются за краем экрана...
-const SPAWN_MAX_DIST = 42; // ...но в пределах загруженных чанков и окна flow field
+const SPAWN_MAX_DIST = 42; // ...но в пределах окна flow field
 const LEASH_DIST = 90; // враг, отставший дальше этого, переносится к игроку
-const AIM_FALLBACK_DIST = 60; // если под прицелом ничего нет — стреляем «в горизонт» по камере
+const AIM_MAX = 120; // дальность луча прицела (= дальности пули)
+const AIM_FALLBACK_DIST = 60; // если под прицелом ничего нет — стреляем «в горизонт»
 const HAND_GUN_COOLDOWN = 0.22; // базовый кулдаун пистолета в руке, с
 const SWORD_COOLDOWN = 0.45; // базовый кулдаун удара мечом, с
 const SPIN_BASE = 50; // цена первого вращения колеса фортуны
@@ -73,42 +83,76 @@ const COUPON_DISCOUNT = 0.5; // купон в магазине — полцен�
 const SECOND_WIND_HP = 0.5; // доля HP при «Втором дыхании»
 const BULLET_BLAST_MULT = 0.5; // урон взрыва пули (гранатомёт) от урона пули
 
+// --- Камера первого лица ---
+const MOUSE_SENS = 0.0023; // рад yaw на пиксель мыши
+const PITCH_SENS = 0.7; // сдвиг горизонта, px на px мыши
+const PITCH_RANGE = 0.45; // доля высоты экрана, на которую уезжает горизонт (кламп рендера: 5–95 %)
+const BOB_FREQ = 1.9; // частота покачивания камеры при беге
+const BOB_AMP = 0.045; // амплитуда по вертикали, юниты
+const MUZZLE_FLASH_TIME = 0.06; // с, вспышка выстрела на вьюмодели
+const DAMAGE_FLASH_TIME = 0.4; // с, красная виньетка после удара
+const TRACER_LEN = 1.2; // длина хвоста трассера пули
+const BEACON_HEIGHT = 60; // высота столба маяка
+
+/** Тинты спрайтов */
+const GOLD_TINT = { r: 1, g: 0.85, b: 0.3 };
+const COUPON_TINT = { r: 0.45, g: 1, b: 0.55 };
+const DRONE_TINT = { r: 0.5, g: 0.75, b: 1 };
+const BLADE_TINT = { r: 0.45, g: 0.85, b: 1 };
+const BOOMERANG_TINT = { r: 0.55, g: 1, b: 0.45 };
+const SHELL_TINT = { r: 1, g: 0.6, b: 0.25 };
+const BEACON_TINT = { r: 1, g: 0.8, b: 0.45 };
+
 /** Стартовое оружие на выбор */
 const START_WEAPONS: { id: HeldWeapon; title: string; desc: string }[] = [
   { id: "gun", title: "Пистолет", desc: "Быстрые точные выстрелы на любую дистанцию. Ствол греется — разброс растёт при непрерывной стрельбе." },
   { id: "sword", title: "Меч", desc: "Взмах бьёт всех врагов в секторе перед собой, урон ×3. Опасно близко, зато толпа режется целиком." },
 ];
 
+/**
+ * Игра целиком: мир, этапы, враги, оружия, магазин, колесо — и софтверный рендер
+ * первого лица (soft/renderer). Babylon здесь остался только как математика (Vector3).
+ */
 export class Game {
-  private engine: Engine;
-  private scene: Scene;
-  private camera!: ThirdPersonCamera;
+  private readonly canvas: HTMLCanvasElement;
+  private renderer: SoftRenderer;
+  private columnMap: ColumnMap;
   private player!: Player;
   private enemies: Enemy[] = [];
-  private enemyFactory: EnemyFactory;
   private crowd = new CrowdSeparator();
-  private projectiles: ProjectilePool;
-  private gold: GoldPool;
+  private projectiles = new ProjectilePool();
+  private gold = new GoldPool();
   private weapons: WeaponSystem;
   /** Оружие в руке (пистолет или меч) — с общими stats игрока; null до выбора на старте */
   private primary: Weapon | null = null;
   /** Очередь на спавн: статы врагов, которых выпустим в ближайшие кадры */
   private pendingSpawns: EnemyStats[] = [];
   private input = new Input();
-  private dirLight: DirectionalLight;
-  private shadows: ShadowGenerator;
-  private glow: GlowLayer;
-  private lightDir = new Vector3(0.35, -1, 0.25).normalize();
+
+  // --- Камера ---
+  private camYaw = 0;
+  /** Сдвиг горизонта в пикселях экрана (pitch) */
+  private pitchPx = 0;
+  private locked = false;
+  private bobPhase = 0;
+  private muzzleFlashT = 0;
+  private damageFlashT = 0;
 
   // --- Состояние этапа ---
   private terrain!: Terrain;
   private flowField!: FlowField;
-  private chunks: ChunkManager;
   private stage = 1;
   private stageTimer = STAGE_DURATION;
   private spawnTimer = 0;
   private choosing = false;
   private dead = false;
+
+  // --- Цель этапа ---
+  private objective: ObjectivePlan | null = null;
+  /** Точка маяка для цели reach (null на этапах-выживаниях) */
+  private objTarget: { x: number; z: number } | null = null;
+  private objHudCache = "";
+  private time = 0;
 
   // --- Колесо фортуны ---
   private wheel = new FortuneWheel();
@@ -140,6 +184,7 @@ export class Game {
 
   private firing = false;
   private flashTimer: number | undefined;
+  private lastFrame = 0;
 
   // --- DOM ---
   private hudHp = document.getElementById("hp")!;
@@ -160,64 +205,36 @@ export class Game {
   private hudStats = document.getElementById("statsHud")!;
   private crosshair = document.getElementById("crosshair")!;
   private lockHint = document.getElementById("lockHint")!;
+  private hudObjective = document.getElementById("objective")!;
+  private objArrow = document.getElementById("objArrow")!;
+  private objText = document.getElementById("objText")!;
+  private objDist = document.getElementById("objDist")!;
 
   constructor(canvas: HTMLCanvasElement) {
-    this.engine = new Engine(canvas, true, { stencil: true });
-    this.scene = new Scene(this.engine);
-    this.scene.collisionsEnabled = true;
-
-    // Камерой управляем вручную (без camera.attachControl), поэтому
-    // подключаем ввод к сцене сами — иначе pointerX/pointerY и клики мертвы.
-    this.scene.attachControl();
-
-    // --- Небо, свет, тени ---
-    setupSky(this.scene, this.lightDir);
-    this.dirLight = setupLighting(this.scene, this.lightDir).sun;
-
-    this.shadows = setupShadows(this.dirLight);
-
-    // Свечение: элитные враги (metadata.elite) и золото (metadata.gold), остальные не светятся
-    this.glow = new GlowLayer("glow", this.scene, { blurKernelSize: 48 });
-    this.glow.intensity = 1.2;
-    this.glow.customEmissiveColorSelector = (mesh, _subMesh, _material, result) => {
-      const glow = mesh.metadata?.glow as [number, number, number] | undefined;
-      if (mesh.metadata?.elite) {
-        const k = (mesh.metadata.glowMult as number | undefined) ?? 1;
-        result.set(k, 0.18 * k, 0.12 * k, 1);
-      }
-      else if (mesh.metadata?.gold) result.set(1, 0.75, 0.2, 1);
-      else if (glow) result.set(glow[0], glow[1], glow[2], 1); // снаряды и клинки автоматических оружий
-      else result.set(0, 0, 0, 0);
-    };
-
-    this.projectiles = new ProjectilePool(this.scene);
-    this.enemyFactory = new EnemyFactory(this.scene);
-    this.gold = new GoldPool(this.scene);
-    this.shadows.addShadowCaster(this.gold.shadowCaster);
+    this.canvas = canvas;
+    this.terrain = new Terrain();
+    this.columnMap = new ColumnMap(this.terrain);
+    this.renderer = new SoftRenderer(canvas, this.columnMap);
     this.weapons = new WeaponSystem(
-      this.scene,
       this.projectiles,
       (e) => this.onEnemyKilled(e),
       (x, z) => this.terrain.floorAt(x, z),
+      {
+        blast: (x, y, z, radius, r, g, b) => this.renderer.addBlast(x, y, z, radius, r, g, b),
+        bolt: (pts) => this.renderer.addBolt(pts),
+      },
     );
-    this.chunks = new ChunkManager(this.scene, this.shadows);
 
     // --- Мир и игрок; первый этап начнётся после выбора оружия ---
     this.initWorld();
     this.projectiles.stats = this.player.weaponStats; // крит, пробитие, рикошет пуль — из общих stats
     this.showWeaponSelect();
 
-    // --- Камера от третьего лица: мышь вращает, колесо — дистанция ---
-    this.camera = new ThirdPersonCamera(this.scene, canvas);
-    this.camera.yaw = this.player.mesh.rotation.y;
-    this.camera.update(1, this.player.cameraAnchor(), this.terrain);
-    setupPostFx(this.scene, this.camera.camera);
-
-    // --- Стрельба и захват курсора: нативные события, чтобы не зависеть от внутренностей движка ---
+    // --- Стрельба и захват курсора ---
     canvas.addEventListener("pointerdown", (e) => {
       if (e.button !== 0 || this.dead || this.choosing) return;
       // Первый клик по полю захватывает курсор; стреляем только с захваченным курсором
-      if (!this.camera.locked) this.camera.lock();
+      if (!this.locked) canvas.requestPointerLock();
       else this.firing = true;
     });
     window.addEventListener("pointerup", (e) => {
@@ -225,10 +242,18 @@ export class Game {
     });
     window.addEventListener("blur", () => (this.firing = false));
     document.addEventListener("pointerlockchange", () => {
-      const locked = this.camera.locked;
-      this.crosshair.style.display = locked ? "block" : "none";
-      this.lockHint.style.display = locked || this.dead || this.choosing ? "none" : "block";
-      if (!locked) this.firing = false;
+      this.locked = document.pointerLockElement === canvas;
+      this.crosshair.style.display = this.locked ? "block" : "none";
+      this.lockHint.style.display = this.locked || this.dead || this.choosing ? "none" : "block";
+      if (!this.locked) this.firing = false;
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!this.locked) return;
+      this.camYaw += e.movementX * MOUSE_SENS;
+      // мышь вверх (movementY < 0) — смотрим вверх: горизонт едет вниз по экрану
+      this.pitchPx -= e.movementY * PITCH_SENS;
+      const range = this.renderer.H * PITCH_RANGE;
+      this.pitchPx = Math.max(-range, Math.min(range, this.pitchPx));
     });
 
     window.addEventListener("keydown", (e) => {
@@ -237,27 +262,33 @@ export class Game {
   }
 
   start(): void {
-    this.scene.onBeforeRenderObservable.add(() => this.update());
-    this.engine.runRenderLoop(() => this.scene.render());
+    this.lastFrame = performance.now();
+    const loop = (now: number) => {
+      const dt = Math.min((now - this.lastFrame) / 1000, 0.05);
+      this.lastFrame = now;
+      this.update(dt);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
   }
 
   resize(): void {
-    this.engine.resize();
+    this.renderer.resize();
+  }
+
+  /** Отпустить курсор (меню, смерть) */
+  private unlock(): void {
+    if (this.locked) document.exitPointerLock();
   }
 
   // ---------- Мир ----------
 
   /** Создаёт бесконечный мир и игрока. Вызывается один раз: мир между этапами не меняется. */
   private initWorld(): void {
-    this.terrain = new Terrain();
-    this.chunks.setTerrain(this.terrain);
-
     const spawnH = this.terrain.getHeight(this.terrain.spawn.x, this.terrain.spawn.z);
-    this.player = new Player(
-      this.scene,
-      new Vector3(this.terrain.spawn.x, spawnH + 1, this.terrain.spawn.z),
-    );
-    this.chunks.update(this.player.position.x, this.player.position.z, true); // старт: всё сразу
+    this.player = new Player(new Vector3(this.terrain.spawn.x, spawnH + 1, this.terrain.spawn.z));
+    // Старт: запекаем всё окно колонн сразу — игра ещё на экране выбора оружия
+    this.columnMap.bakeAllAround(this.player.position.x, this.player.position.z);
 
     this.flowField = new FlowField(this.terrain);
     this.flowField.recompute(this.player.position.x, this.player.position.z);
@@ -278,31 +309,22 @@ export class Game {
     this.weaponOverlay.style.display = "flex";
   }
 
-  /** Выбрано стартовое оружие: модель с ним в руке, экземпляр Weapon на общих stats, первый этап */
+  /** Выбрано стартовое оружие: экземпляр Weapon на общих stats, первый этап */
   private pickWeapon(kind: HeldWeapon): void {
     this.primaryKind = kind;
     this.primary =
       kind === "sword"
-        ? new Sword(this.scene, this.player.weaponStats, SWORD_COOLDOWN, {
+        ? new Sword(this.player.weaponStats, SWORD_COOLDOWN, {
             enemies: () => this.enemies,
             origin: () => this.player.position,
-            yaw: () => this.player.mesh.rotation.y,
+            yaw: () => this.player.yaw,
             floorAt: (x, z) => this.terrain.floorAt(x, z),
             onHit: (e, dmg, point, force) => this.weapons.onWeaponHit(e, dmg, point, this.enemies, force),
             onKill: (e) => this.onEnemyKilled(e),
             dash: (dist) => this.dashPlayer(dist),
+            onArc: (x, y, z, yaw, arc) => this.renderer.addArc(x, y, z, SWORD_RANGE, yaw, arc / 2),
           })
         : new Gun(this.projectiles, this.player.weaponStats, { baseCooldown: HAND_GUN_COOLDOWN });
-
-    // Модель: сразу процедурная; если есть /models/player.glb — подменится, когда загрузится
-    const setModel = (model: CharacterModel) => {
-      if (this.player.model) {
-        for (const m of this.player.model.meshes) this.shadows.removeShadowCaster(m);
-      }
-      this.player.attachModel(model);
-      for (const m of model.meshes) this.shadows.addShadowCaster(m);
-    };
-    setModel(createPlayerModel(this.scene, PLAYER_MODEL_URL, setModel, undefined, kind));
 
     this.weaponOverlay.style.display = "none";
     this.choosing = false;
@@ -358,7 +380,7 @@ export class Game {
    * Новые враги уже усилены под текущий этап, и сразу приходит толпа.
    */
   private beginStage(): void {
-    this.stageTimer = STAGE_DURATION;
+    this.rollObjective();
     this.spawnTimer = this.spawnInterval();
     this.rollStock();
     if (this.isBossStage()) {
@@ -367,8 +389,39 @@ export class Game {
       this.showFlash(`Этап ${this.stage} — ШТУРМ!`);
     } else {
       this.spawnEnemies(this.crowdSize());
-      this.showFlash(`Этап ${this.stage}`);
+      this.showFlash(`Этап ${this.stage} · ${this.objective!.title}`);
     }
+  }
+
+  /** Цель этапа: план из objectives.ts; для reach — запоминаем точку маяка */
+  private rollObjective(): void {
+    let plan = planForStage(this.stage, BOSS_STAGE_EVERY);
+    this.objTarget = null;
+    if (plan.type === "reach") {
+      // Если рядом зиккурат — цель «восхождение»: маяк на вершине (проверка
+      // достижимости не нужна: туда ведут прыжки по ярусам и пандус, а не flow field)
+      const p = this.player.position;
+      const zig = this.terrain.nearestStructure(p.x, p.z, plan.minDist, plan.maxDist + 60, "ziggurat");
+      if (zig && Math.random() < 0.65) {
+        plan = { ...plan, title: "Поднимитесь на вершину зиккурата", timeLimit: 100 };
+        this.objTarget = { x: zig.cx, z: zig.cz };
+      } else {
+        this.objTarget = this.pickBeaconPoint(plan);
+      }
+    }
+    this.objective = plan;
+    this.stageTimer = plan.timeLimit;
+    this.objHudCache = ""; // принудительно перерисовать строку цели
+  }
+
+  /** Точка для маяка: открытая и достижимая (та же проверка, что у точек спавна) */
+  private pickBeaconPoint(plan: ObjectivePlan): { x: number; z: number } {
+    const from = { x: this.player.position.x, z: this.player.position.z };
+    let pos = this.terrain.randomOpenPoint(from, plan.minDist, plan.maxDist);
+    for (let t = 0; t < 10 && !this.flowField.isReachable(pos.x, pos.z); t++) {
+      pos = this.terrain.randomOpenPoint(from, plan.minDist, plan.maxDist);
+    }
+    return pos;
   }
 
   /** Случайная открытая и достижимая точка за краем экрана */
@@ -395,16 +448,14 @@ export class Game {
     for (let i = 0; i < n; i++) this.pendingSpawns.push(elite && isElite!(i) ? elite : normal);
   }
 
-  /** Выпустить из очереди несколько врагов (клон модели не бесплатен — размазываем по кадрам) */
+  /** Выпустить из очереди несколько врагов */
   private flushSpawns(): void {
-    if (!this.enemyFactory.ready) return; // первые кадры: ждём шаблон, иначе первая толпа выйдет процедурной
     for (let k = 0; k < SPAWNS_PER_FRAME && this.pendingSpawns.length > 0; k++) {
       const stats = this.pendingSpawns.shift()!;
       const pos = this.pickSpawnPoint();
-      const h = this.terrain.getHeight(pos.x, pos.z);
-      const enemy = this.enemyFactory.create(new Vector3(pos.x, h, pos.z), stats);
+      const h = this.enemyFloorAt(pos.x, pos.z);
+      const enemy = new Enemy(new Vector3(pos.x, h, pos.z), stats);
       enemy.placeAt(pos.x, h, pos.z);
-      if (ENEMY_SHADOWS) for (const m of enemy.model.meshes) this.shadows.addShadowCaster(m);
       this.enemies.push(enemy);
     }
   }
@@ -427,19 +478,21 @@ export class Game {
       const dz = enemy.node.position.z - p.z;
       if (dx * dx + dz * dz < LEASH_DIST * LEASH_DIST) continue;
       const pos = this.pickSpawnPoint();
-      enemy.placeAt(pos.x, this.terrain.getHeight(pos.x, pos.z), pos.z);
+      enemy.placeAt(pos.x, this.enemyFloorAt(pos.x, pos.z), pos.z);
     }
   }
 
   /**
    * Убитый враг: золото выпадает на землю (с бонусом «Жадности» и множителем «Кошелька»),
    * с небольшим шансом — купон колеса; перки на убийство (вампиризм, ярость, охлаждение).
+   * Рендеру — труп: спрайт оседает и гаснет.
    */
   private onEnemyKilled(enemy: Enemy): void {
     const p = enemy.node.position;
     const floor = this.terrain.floorAt(p.x, p.z);
     this.gold.spawn(p, Math.round((enemy.gold + this.player.goldBonus) * this.perks.goldMult), floor);
     if (Math.random() < (enemy.elite ? COUPON_CHANCE_ELITE : COUPON_CHANCE)) this.gold.spawnCoupon(p, floor);
+    this.renderer.addCorpse(p.x, enemy.feetY, p.z, enemy.scale, enemy.tint);
 
     const pk = this.perks;
     if (pk.vampirism > 0) this.player.hp = Math.min(this.player.maxHp, this.player.hp + pk.vampirism);
@@ -481,7 +534,7 @@ export class Game {
   private openWheel(): void {
     this.choosing = true;
     this.firing = false;
-    this.camera.unlock();
+    this.unlock();
     this.lockHint.style.display = "none";
     this.wheel.emptyShare = this.perks.emptyShare;
     this.wheel.open(this.wheelSlots(), {
@@ -587,7 +640,7 @@ export class Game {
     this.applyUpgrade(slot.id.slice(2));
   }
 
-  /** Босс: огромный, ярко-красный, светится как элитный, очень крепкий */
+  /** Босс: огромный, ярко-красный, очень крепкий */
   private bossStats(goldMult = 1): EnemyStats {
     const base = this.enemyStats();
     return {
@@ -624,14 +677,7 @@ export class Game {
   }
 
   private grantWeapon(id: WeaponId): boolean {
-    if (!this.weapons.grant(id, this.player)) return false;
-    this.refreshShadows();
-    return true;
-  }
-
-  /** Меши автоматики, появившиеся после grant/крафта, должны отбрасывать тень */
-  private refreshShadows(): void {
-    for (const m of this.weapons.shadowCasters) this.shadows.addShadowCaster(m);
+    return this.weapons.grant(id, this.player);
   }
 
   /** Потратить ингредиент рецепта: откатить баф/предмет, забрать оружие, списать купоны */
@@ -774,7 +820,7 @@ export class Game {
         for (const e of this.enemies) {
           if (e.alive && Vector3.DistanceSquared(e.node.position, p) <= radius * radius) e.applySlow(mult, seconds);
         }
-        this.weapons.blast(new Vector3(p.x, p.y - 1, p.z), radius, new Color3(0.5, 0.8, 1));
+        this.weapons.blast(new Vector3(p.x, p.y - 1, p.z), radius, [0.5, 0.8, 1]);
       },
       timedBuff: (name, seconds, apply, undo) => {
         apply();
@@ -801,27 +847,34 @@ export class Game {
         return game.freeSpins;
       },
       consume: (ing) => this.consume(ing),
-      refreshShadows: () => this.refreshShadows(),
     };
+  }
+
+  /**
+   * Опора под точкой по отрисованному миру: верх колонны стены, если она там
+   * отрисована, иначе аналитический рельеф (гладкая ходьба без ступеней 2×2).
+   */
+  private floorAtRendered(x: number, z: number): number {
+    return this.columnMap.wallTopAt(x, z) ?? this.terrain.getHeight(x, z);
   }
 
   /** Рывок-удар меча: игрок смещается вперёд, пока не упрётся в стену */
   private dashPlayer(distance: number): void {
-    const yaw = this.player.mesh.rotation.y;
+    const yaw = this.player.yaw;
     const dx = Math.sin(yaw);
     const dz = Math.cos(yaw);
-    const pos = this.player.mesh.position;
+    const pos = this.player.position;
     const step = 0.25;
     let moved = 0;
     while (moved + step <= distance) {
       const nx = pos.x + dx * step;
       const nz = pos.z + dz * step;
-      if (this.terrain.isWallAt(nx, nz)) break;
+      if (this.columnMap.circleHitsWall(nx, nz, PLAYER_RADIUS, pos.y - 1)) break;
       pos.x = nx;
       pos.z = nz;
       moved += step;
     }
-    if (moved > 0) pos.y = Math.max(pos.y, this.terrain.floorAt(pos.x, pos.z) + 1);
+    if (moved > 0) pos.y = Math.max(pos.y, this.floorAtRendered(pos.x, pos.z) + 1);
   }
 
   private tickTimedBuffs(dt: number): void {
@@ -854,7 +907,7 @@ export class Game {
 
   /** Взрыв пули (Гранатомёт): кольцо и урон всем вокруг точки попадания, кроме уже поражённого */
   private bulletBlast(point: Vector3, radius: number, bulletDamage: number): void {
-    this.weapons.blast(new Vector3(point.x, this.terrain.floorAt(point.x, point.z) + 0.05, point.z), radius, new Color3(1, 0.6, 0.2));
+    this.weapons.blast(new Vector3(point.x, this.terrain.floorAt(point.x, point.z) + 0.05, point.z), radius, [1, 0.6, 0.2]);
     const dmg = Math.max(1, Math.round(bulletDamage * BULLET_BLAST_MULT));
     for (const e of this.enemies) {
       if (!e.alive || Vector3.DistanceSquared(e.node.position, point) > radius * radius) continue;
@@ -864,9 +917,10 @@ export class Game {
 
   /** Конец этапа: пауза и выбор улучшения; после выбора игра продолжается с того же места */
   private onStageEnd(): void {
+    this.objTarget = null;
     this.choosing = true;
     this.firing = false;
-    this.camera.unlock();
+    this.unlock();
     this.lockHint.style.display = "none";
     this.upgradeCards.innerHTML = "";
 
@@ -890,17 +944,10 @@ export class Game {
 
   // ---------- Игровой цикл ----------
 
-  private update(): void {
-    const dt = Math.min(this.engine.getDeltaTime() / 1000, 0.05);
-    const getHeight = (x: number, z: number) => this.terrain.getHeight(x, z);
-
-    // Камера сначала — чтобы прицел по центру экрана считался по текущему положению мыши...
-    this.camera.update(dt, this.player.cameraAnchor(), this.terrain);
-    if (!this.dead && !this.choosing) this.simulate(dt, getHeight);
-    // ...и после — чтобы догнать игрока, сдвинувшегося за кадр
-    this.camera.update(dt, this.player.cameraAnchor(), this.terrain);
-    this.dirLight.position = this.player.position.subtract(this.lightDir.scale(40));
-    this.dirLight.setDirectionToTarget(this.player.position);
+  private update(dt: number): void {
+    this.time += dt;
+    if (!this.dead && !this.choosing) this.simulate(dt);
+    this.render(dt);
 
     // HUD
     this.hudHp.textContent =
@@ -911,6 +958,39 @@ export class Game {
     this.hudWave.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
     this.updateGoldHud();
     this.updateStatsHud();
+    this.updateObjectiveHud();
+  }
+
+  /**
+   * Строка цели по центру сверху: название, стрелка-компас (относительно камеры) и дистанция.
+   * Текст трогаем только при изменении, стрелку крутим каждый кадр.
+   */
+  private updateObjectiveHud(): void {
+    const plan = this.objective;
+    if (!plan || this.dead) {
+      this.hudObjective.style.display = "none";
+      this.objHudCache = "";
+      return;
+    }
+    this.hudObjective.style.display = "flex";
+    let dist = "";
+    if (plan.type === "reach" && this.objTarget) {
+      const dx = this.objTarget.x - this.player.position.x;
+      const dz = this.objTarget.z - this.player.position.z;
+      dist = `${Math.round(Math.hypot(dx, dz))} м`;
+      this.objArrow.style.display = "inline-block";
+      // 0° — цель строго по курсу камеры; дальше — по часовой (CSS rotate)
+      const rel = Math.atan2(dx, dz) - this.camYaw;
+      this.objArrow.style.transform = `rotate(${((rel * 180) / Math.PI).toFixed(1)}deg)`;
+    } else {
+      this.objArrow.style.display = "none";
+    }
+    const key = `${plan.title}|${dist}`;
+    if (key !== this.objHudCache) {
+      this.objHudCache = key;
+      this.objText.textContent = plan.title;
+      this.objDist.textContent = dist;
+    }
   }
 
   /** Сводка справа сверху: оружие и его характеристики, автоматика, статы персонажа, предметы, временные бафы */
@@ -1011,43 +1091,79 @@ export class Game {
     this.hudGoldHint.style.display = "block";
   }
 
+  /** Опора для врагов: рельеф, а на пандусе сооружения — его склон (твёрдые части врагам недоступны) */
+  private enemyFloorAt(x: number, z: number): number {
+    const st = this.terrain.structureAt(x, z);
+    return st && st.ramp ? st.top : this.terrain.getHeight(x, z);
+  }
+
   /** Один шаг игровой логики (не вызывается на паузе и после смерти) */
-  private simulate(dt: number, getHeight: (x: number, z: number) => number): void {
+  private simulate(dt: number): void {
+    const getHeight = (x: number, z: number) => this.enemyFloorAt(x, z);
+
     // Таймер этапа: по истечении — пауза и выбор улучшения
     this.stageTimer -= dt;
+
+    // Цель «маяк»: успех — войти в радиус, пока есть время; бонус золотом у маяка
+    const plan = this.objective;
+    if (plan?.type === "reach" && this.objTarget) {
+      const dx = this.player.position.x - this.objTarget.x;
+      const dz = this.player.position.z - this.objTarget.z;
+      if (dx * dx + dz * dz <= plan.radius * plan.radius) {
+        const bonus = plan.bonusBase + plan.bonusPerStage * this.stage;
+        const floor = this.terrain.floorAt(this.objTarget.x, this.objTarget.z);
+        this.gold.spawn(new Vector3(this.objTarget.x, floor + 1, this.objTarget.z), bonus, floor);
+        this.showFlash(`Маяк достигнут! +${bonus} золота`);
+        this.onStageEnd();
+        return;
+      }
+    }
+
     if (this.stageTimer <= 0) {
       this.stageTimer = 0;
+      if (plan?.type === "reach") this.showFlash("Время вышло — маяк угас");
       this.onStageEnd();
       return;
     }
 
-    // Движение относительно камеры: W — от камеры, D — вправо от неё
+    // Движение относительно камеры: W — вперёд по взгляду, D — вправо
     const axis = this.input.moveAxis();
     const moving = axis.x !== 0 || axis.z !== 0;
-    const moveDir = moving ? this.camera.forward().scale(axis.z).addInPlace(this.camera.right().scale(axis.x)) : null;
-    // Точка под перекрестием — каждый кадр, не только при стрельбе
-    const aimPoint = this.pickAimPoint();
-    // Оружие всегда наготове: корпус смотрит на точку прицела (камера через плечо смещена,
-    // поэтому это не азимут камеры), движение вбок/назад — стрейф
-    const faceYaw = aimPoint
-      ? Math.atan2(aimPoint.x - this.player.position.x, aimPoint.z - this.player.position.z)
-      : this.camera.yaw;
-    // Игрок ходит по рельефу и по верху стен
-    this.player.update(dt, moveDir, faceYaw, (x, z) => this.terrain.floorAt(x, z), {
+    const sy = Math.sin(this.camYaw);
+    const cy = Math.cos(this.camYaw);
+    const moveDir = moving
+      ? new Vector3(sy * axis.z + cy * axis.x, 0, cy * axis.z - sy * axis.x)
+      : null;
+    // Корпус = камера (первое лицо): мгновенно, без доворота
+    this.player.yaw = this.camYaw;
+    // Коллизии — строго по отрисованному миру: круг игрока против колонн стен
+    // карты (аналитические hex-границы с блоками 2×2 не совпадают — иначе игрок
+    // визуально входит в стену). Опора — верх колонны стены или гладкий рельеф.
+    const isBlocked = (x: number, z: number, feetY: number) =>
+      this.columnMap.circleHitsWall(x, z, PLAYER_RADIUS, feetY);
+    this.player.update(dt, moveDir, null, (x, z) => this.floorAtRendered(x, z), isBlocked, {
       jump: this.input.takePress("Space"),
       jumpHeld: this.input.isDown("Space"),
       crouch: this.input.isDown("ControlLeft") || this.input.isDown("ControlRight") || this.input.isDown("KeyC"),
     });
-    // Подгружаем чанки вокруг новой позиции игрока
-    this.chunks.update(this.player.position.x, this.player.position.z);
-    if (aimPoint) this.player.aim(aimPoint);
+    // Дозапекаем колонны вокруг новой позиции игрока
+    this.columnMap.ensureAround(this.player.position.x, this.player.position.z);
+
+    // Покачивание камеры от фактической скорости
+    this.bobPhase += this.player.motion.speed * dt * BOB_FREQ;
+    this.muzzleFlashT = Math.max(0, this.muzzleFlashT - dt);
+    this.damageFlashT = Math.max(0, this.damageFlashT - dt);
+
+    // Точка под перекрестием — каждый кадр, не только при стрельбе
+    const aimPoint = this.pickAimPoint();
     const primary = this.primary!;
     primary.update(dt);
     if (this.firing && aimPoint) {
       // Пистолет: пуля из дула в точку под перекрестием. Меч: серия взмахов по сектору перед корпусом
-      primary.tryFire(this.player.muzzle(), aimPoint);
+      if (primary.tryFire(this.player.muzzle(), aimPoint) && primary instanceof Gun) {
+        this.muzzleFlashT = MUZZLE_FLASH_TIME;
+      }
     }
-    this.player.swing(primary.swingAngle);
 
     // Маршруты пересчитываются, когда игрок сменил клетку
     this.flowField.recompute(this.player.position.x, this.player.position.z);
@@ -1056,7 +1172,7 @@ export class Game {
     this.tickSpawner(dt);
     this.leashEnemies();
 
-    // Стены для врагов — hex-клетки: O(1) на проверку вместо перебора всех коллайдеров сцены
+    // Стены для врагов — hex-клетки: O(1) на проверку
     const blocked = (x: number, z: number) => this.terrain.isWallAt(x, z);
     const pk = this.perks;
     let damage = 0;
@@ -1072,6 +1188,7 @@ export class Game {
     this.crowd.separate(this.enemies, this.player.position.x, this.player.position.z, blocked);
     if (damage > 0) {
       this.player.takeDamage(damage);
+      this.damageFlashT = DAMAGE_FLASH_TIME;
       if (this.player.hp <= 0) this.die();
     }
 
@@ -1107,27 +1224,179 @@ export class Game {
     }
   }
 
+  /** Глаза камеры: позиция игрока + высота + покачивание */
+  private eyePos(): Vector3 {
+    const p = this.player.position;
+    const speedK = Math.min(1, this.player.motion.speed / 9);
+    const bob = Math.sin(this.bobPhase * 2) * BOB_AMP * speedK;
+    return new Vector3(p.x, this.player.eyeY() + bob, p.z);
+  }
+
+  /** Направление взгляда с учётом сдвига горизонта (согласовано с проекцией рендера) */
+  private aimDir(): Vector3 {
+    // Строка sy экрана соответствует лучу с подъёмом (horizon − sy)/focal; центр — sy = H/2
+    const up = this.pitchPx / this.renderer.focal;
+    const dir = new Vector3(Math.sin(this.camYaw), up, Math.cos(this.camYaw));
+    return dir.normalize();
+  }
+
   /**
-   * Точка прицеливания — что под перекрестием в центре экрана: враг, стена или земля.
-   * Если там небо — точка далеко по горизонтальному направлению камеры.
+   * Точка прицеливания — что под перекрестием в центре экрана: враг (капсула),
+   * стена или земля (реймарш по карте колонн). Если небо — далеко по взгляду.
    */
   private pickAimPoint(): Vector3 | null {
-    const w = this.engine.getRenderWidth();
-    const h = this.engine.getRenderHeight();
-    const pick = this.scene.pick(
-      w / 2,
-      h / 2,
-      (m) => m.name === "enemy" || m.name.startsWith("wall_") || this.chunks.isGround(m),
-      false,
-      this.camera.camera,
-    );
-    if (pick?.pickedPoint) {
-      // Цель слишком близко к игроку (камера смотрит сквозь него) — стреляем по камере
-      const dx = pick.pickedPoint.x - this.player.position.x;
-      const dz = pick.pickedPoint.z - this.player.position.z;
-      if (dx * dx + dz * dz > 1) return pick.pickedPoint;
+    const eye = this.eyePos();
+    const dir = this.aimDir();
+    let bestT = this.renderer.raycast(eye.x, eye.y, eye.z, dir.x, dir.y, dir.z, AIM_MAX);
+
+    // Враги: луч против капсул
+    const rayLen = Math.min(bestT, AIM_MAX);
+    const rayEnd = eye.add(dir.scale(rayLen));
+    for (const e of this.enemies) {
+      if (!e.alive) continue;
+      const c = e.node.position;
+      // Грубый отсев по дистанции до луча
+      const h = e.hitHalfAxis;
+      const { dist, s } = segmentSegmentDistance(
+        eye,
+        rayEnd,
+        new Vector3(c.x, c.y - h, c.z),
+        new Vector3(c.x, c.y + h, c.z),
+      );
+      if (dist > e.hitRadius + 0.15) continue;
+      const t = s * rayLen;
+      if (t < bestT) bestT = t;
     }
-    return this.player.position.add(this.camera.forward().scale(AIM_FALLBACK_DIST));
+
+    if (!isFinite(bestT)) {
+      return eye.add(dir.scale(AIM_FALLBACK_DIST));
+    }
+    return eye.add(dir.scale(Math.max(0.5, bestT)));
+  }
+
+  // ---------- Отрисовка кадра ----------
+
+  private render(dt: number): void {
+    const r = this.renderer;
+    const eye = this.eyePos();
+    r.begin(eye.x, eye.y, eye.z, this.camYaw, r.H / 2 + this.pitchPx);
+
+    // Враги — спрайты: кадр ходьбы по фазе, замах — атакующий кадр
+    for (const e of this.enemies) {
+      const p = e.node.position;
+      const frame = e.attackK > 0 ? ENEMY_ATTACK : ENEMY_FRAMES[Math.floor(e.walkPhase) & 1];
+      const h = 2 * e.scale;
+      r.sprite(frame, p.x, e.feetY, p.z, h, h * 0.7, e.tint, e.flashK, e.elite ? 0.35 : 0);
+    }
+
+    // Золото и купоны
+    for (const c of this.gold.coins) {
+      if (c.kind === "gold") {
+        const frame = COIN_FRAMES[Math.floor(c.spin * 2) & 3];
+        const s = 0.32 * c.size;
+        r.sprite(frame, c.pos.x, c.pos.y - s / 2, c.pos.z, s, s, GOLD_TINT, 0, 0.5);
+      } else {
+        r.sprite(COUPON, c.pos.x, c.pos.y - 0.15, c.pos.z, 0.3, 0.48, COUPON_TINT, 0, 0.5);
+      }
+    }
+
+    // Автоматика: дроны, клинки, бумеранги, снаряды мортиры
+    for (const d of this.weapons.drones) {
+      r.sprite(DRONE, d.pos.x, d.pos.y - 0.22, d.pos.z, 0.45, 0.75, DRONE_TINT, 0, 0.3);
+    }
+    const blades = this.weapons.bladePositions;
+    if (blades) {
+      for (const b of blades) {
+        r.sprite(BLADE_FRAMES[Math.floor(b.angle * 2) & 1], b.x, b.y - 0.15, b.z, 0.3, 0.54, BLADE_TINT, 0, 0.5);
+      }
+    }
+    const flights = this.weapons.boomerangFlights;
+    if (flights) {
+      for (const f of flights) {
+        r.sprite(BOOMERANG_FRAMES[Math.floor(f.spin / Math.PI) & 1], f.pos.x, f.pos.y - 0.25, f.pos.z, 0.5, 0.5, BOOMERANG_TINT, 0, 0.5);
+      }
+    }
+    const shells = this.weapons.mortarShells;
+    if (shells) {
+      for (const s of shells) {
+        r.sprite(SHELL, s.pos.x, s.pos.y - 0.17, s.pos.z, 0.34, 0.34, SHELL_TINT, 0, 0.7);
+      }
+    }
+
+    // Трассеры пуль
+    for (const b of this.projectiles.bullets) {
+      r.streak(
+        b.pos.x - b.dir.x * TRACER_LEN,
+        b.pos.y - b.dir.y * TRACER_LEN,
+        b.pos.z - b.dir.z * TRACER_LEN,
+        b.pos.x,
+        b.pos.y,
+        b.pos.z,
+        1,
+        0.85,
+        0.3,
+      );
+    }
+
+    // Маяк цели: столб света + кольцо радиуса
+    if (this.objective?.type === "reach" && this.objTarget) {
+      const floor = this.terrain.floorAt(this.objTarget.x, this.objTarget.z);
+      const pulse = 0.8 + 0.2 * Math.sin(this.time * 3);
+      r.sprite(BEACON_BEAM, this.objTarget.x, floor, this.objTarget.z, BEACON_HEIGHT, 2.5, BEACON_TINT, 0, 0.9);
+      r.ring(this.objTarget.x, floor + 0.1, this.objTarget.z, this.objective.radius, 1 * pulse, 0.8 * pulse, 0.4 * pulse);
+    }
+
+    // Аура Radiance — пульсирующее кольцо вокруг игрока
+    const aura = this.weapons.auraRadius;
+    if (aura !== null) {
+      const p = this.player.position;
+      const k = 0.5 + 0.15 * Math.sin(this.time * 3);
+      r.ring(p.x, p.y - 1 + 0.1, p.z, aura, 1 * k, 0.45 * k, 0.12 * k);
+    }
+    // Ионные поля мортиры
+    const fields = this.weapons.ionFields;
+    if (fields) {
+      for (const f of fields) {
+        const k = Math.min(1, f.life / 0.4) * (0.7 + 0.3 * Math.sin(f.life * 18));
+        r.ring(f.pos.x, f.pos.y + 0.1, f.pos.z, 3.2, 0.5 * k, 0.8 * k, 1 * k);
+      }
+    }
+
+    // Вьюмодель оружия
+    this.renderViewmodel();
+
+    // Виньетка урона
+    if (this.damageFlashT > 0) r.damageFlash((this.damageFlashT / DAMAGE_FLASH_TIME) * 0.8);
+
+    r.end(dt);
+  }
+
+  /** Оружие в руках поверх кадра: пистолет с вспышкой или меч с кадрами взмаха */
+  private renderViewmodel(): void {
+    const r = this.renderer;
+    if (!this.primary || this.dead) return;
+    const scale = Math.max(2, Math.round(r.H / 80));
+    const speedK = Math.min(1, this.player.motion.speed / 9);
+    const bobX = Math.sin(this.bobPhase) * 2 * speedK;
+    const bobY = Math.abs(Math.cos(this.bobPhase)) * 2 * speedK;
+
+    if (this.primary instanceof Gun) {
+      const w = GUN_VIEW.w * scale;
+      const h = GUN_VIEW.h * scale;
+      const x = r.W / 2 - w / 2 + bobX;
+      const y = r.H - h + bobY;
+      r.viewmodel(GUN_VIEW, x, y, scale);
+      if (this.muzzleFlashT > 0) {
+        const fw = MUZZLE_FLASH.w * scale;
+        r.viewmodel(MUZZLE_FLASH, x + w / 2 - fw / 2, y - MUZZLE_FLASH.h * scale * 0.7, scale);
+      }
+    } else {
+      const swing = this.primary.swingAngle;
+      const spr = Math.abs(swing) > 0.6 ? SWORD_SWING1 : Math.abs(swing) > 0.15 ? SWORD_SWING0 : SWORD_IDLE;
+      const w = spr.w * scale;
+      const h = spr.h * scale;
+      r.viewmodel(spr, r.W * 0.62 - w / 2 + bobX, r.H - h + 6 * scale + bobY, scale);
+    }
   }
 
   private showFlash(text: string): void {
@@ -1148,7 +1417,7 @@ export class Game {
     }
     this.dead = true;
     this.firing = false;
-    this.camera.unlock();
+    this.unlock();
     this.lockHint.style.display = "none";
     this.deathInfo.textContent = `Этап ${this.stage}. Нажмите R, чтобы начать новый забег`;
     this.overlay.style.display = "flex";

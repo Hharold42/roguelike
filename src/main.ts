@@ -1,5 +1,6 @@
-// Подключаем загрузчик glTF/GLB на будущее — сюда лягут модельки из Astra/Sketchfab
-import "@babylonjs/loaders/glTF";
+// Пиксельный шрифт UI (локально, без CDN): латиница + кириллица
+import "@fontsource/press-start-2p/latin-400.css";
+import "@fontsource/press-start-2p/cyrillic-400.css";
 import { Game } from "./game";
 
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;

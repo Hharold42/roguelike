@@ -7,22 +7,27 @@ import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import type { Camera } from "@babylonjs/core/Cameras/camera";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { ImageProcessingConfiguration } from "@babylonjs/core/Materials/imageProcessingConfiguration";
+import { PostProcess } from "@babylonjs/core/PostProcesses/postProcess";
+import { Effect } from "@babylonjs/core/Materials/effect";
+import { Texture } from "@babylonjs/core/Materials/Textures/texture";
+import type { Engine } from "@babylonjs/core/Engines/engine";
 import { Scene } from "@babylonjs/core/scene";
 import { SkyMaterial } from "@babylonjs/materials/sky/skyMaterial";
 
 // --- Небо и туман ---
-const SKY_TURBIDITY = 6; // мутность атмосферы: больше — белёсый горизонт
-const SKY_RAYLEIGH = 1.6; // голубизна
-const SKY_LUMINANCE = 1.0;
-const FOG_DENSITY = 0.014; // край загруженных чанков (~70 юнитов) должен тонуть в дымке
-const FOG_COLOR = new Color3(0.74, 0.8, 0.9); // цвет дымки у горизонта — под небо
+// Вечный закат: низкое солнце, пыльный тёплый горизонт, холодные тени
+const SKY_TURBIDITY = 9; // мутность атмосферы: больше — белёсый горизонт
+const SKY_RAYLEIGH = 2.4; // больше — краснее закат
+const SKY_LUMINANCE = 0.85;
+const FOG_DENSITY = 0.016; // край загруженных чанков (~70 юнитов) должен тонуть в дымке
+const FOG_COLOR = new Color3(0.66, 0.58, 0.62); // цвет дымки у горизонта — пыльная розовато-серая
 
 // --- Свет ---
-const SUN_COLOR = new Color3(1.0, 0.94, 0.82);
-const SUN_INTENSITY = 1.15;
-const SKY_AMBIENT = new Color3(0.55, 0.65, 0.85); // рассеянный свет неба (сверху)
-const GROUND_AMBIENT = new Color3(0.3, 0.27, 0.22); // отражённый от земли (снизу)
-const AMBIENT_INTENSITY = 0.7; // теневые грани стен должны читаться, а не быть чёрными
+const SUN_COLOR = new Color3(1.0, 0.82, 0.58);
+const SUN_INTENSITY = 1.05;
+const SKY_AMBIENT = new Color3(0.48, 0.52, 0.72); // рассеянный свет неба (сверху)
+const GROUND_AMBIENT = new Color3(0.32, 0.26, 0.22); // отражённый от земли (снизу)
+const AMBIENT_INTENSITY = 0.65; // теневые грани стен должны читаться, а не быть чёрными
 
 // --- Тени ---
 // 1024² на 64 юнита = 16 px/юнит — как было у 2048² на 90, но в 4 раза меньше пикселей карты.
@@ -127,4 +132,77 @@ export function setupPostFx(scene: Scene, camera: Camera): DefaultRenderingPipel
   ip.vignetteColor.set(0.02, 0.02, 0.05, 0);
 
   return pipeline;
+}
+
+// ---------- Ретро-рендер (Doom 1993, доведённый до блеска) ----------
+
+/** Глобальный выключатель ретро-режима: false — чистая картинка как раньше */
+export const RETRO = true;
+/** Высота внутреннего буфера в пикселях; ширина — по пропорции окна. 320 — как 320×200 у Doom, с запасом на широкий экран */
+const PIXEL_HEIGHT = 320;
+/** Градаций на канал после дизеринга: 6³ = 216 цветов — близко к палитре 1993 года */
+const PALETTE_LEVELS = 6;
+
+/**
+ * Пикселизация: движок рендерит в буфер ~PIXEL_HEIGHT по вертикали, браузер растягивает
+ * канвас на весь экран без сглаживания (CSS image-rendering: pixelated в index.html).
+ * Уровень — целый, иначе пиксели на экране получаются разного размера.
+ * Вызывать при старте и на каждый resize окна.
+ */
+export function applyPixelScale(engine: Engine): void {
+  if (!RETRO) return;
+  const h = engine.getRenderingCanvas()?.clientHeight ?? 0;
+  if (h <= 0) return;
+  const level = Math.max(1, Math.round(h / PIXEL_HEIGHT));
+  if (engine.getHardwareScalingLevel() !== level) engine.setHardwareScalingLevel(level);
+}
+
+// Палитра + ordered dithering (матрица Байера 4×4, битовый трюк без таблицы).
+// Постпроцесс работает в низком разрешении, поэтому паттерн дизеринга совпадает с пикселями.
+Effect.ShadersStore["retroDitherFragmentShader"] = `
+varying vec2 vUV;
+uniform sampler2D textureSampler;
+uniform vec2 texelSize;
+uniform float levels;
+
+float bayer2(vec2 a) {
+  a = floor(a);
+  return fract(a.x / 2.0 + a.y * a.y * 0.75);
+}
+float bayer4(vec2 a) {
+  return bayer2(0.5 * a) * 0.25 + bayer2(a);
+}
+
+void main(void) {
+  vec3 c = texture2D(textureSampler, vUV).rgb;
+  float d = bayer4(vUV / texelSize);
+  c = floor(c * levels + d) / levels;
+  gl_FragColor = vec4(c, 1.0);
+}
+`;
+
+/**
+ * Финальный проход ретро-стиля: квантование в палитру с дизерингом.
+ * Создаётся ПОСЛЕ setupPostFx, чтобы идти последним в цепочке (поверх bloom и тонмаппинга).
+ * FXAA выключаем: сглаживание размывает пиксели, которые мы только что сделали чёткими.
+ */
+export function setupRetroFx(camera: Camera, engine: Engine, pipeline: DefaultRenderingPipeline): void {
+  if (!RETRO) return;
+  pipeline.fxaaEnabled = false;
+
+  const pp = new PostProcess(
+    "retroDither",
+    "retroDither",
+    ["texelSize", "levels"],
+    null,
+    1.0,
+    camera,
+    Texture.NEAREST_SAMPLINGMODE,
+    engine,
+  );
+  pp.onApply = (effect) => {
+    // Размер буфера читаем на каждый кадр — переживает resize окна
+    effect.setFloat2("texelSize", 1 / engine.getRenderWidth(), 1 / engine.getRenderHeight());
+    effect.setFloat("levels", PALETTE_LEVELS);
+  };
 }

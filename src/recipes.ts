@@ -24,8 +24,6 @@ export interface CraftHost extends ItemHost {
   coupons: number;
   /** Потратить ингредиент (Game откатывает баф/предмет и убирает оружие) */
   consume(ing: Ingredient): void;
-  /** Тени для новых мешей автоматики после grant/makeSwarm */
-  refreshShadows(): void;
 }
 
 export interface Recipe {
@@ -139,7 +137,6 @@ export const RECIPES: readonly Recipe[] = [
     done: ({ weapons }) => weapons.has("saw"),
     craft: (host) => {
       host.weapons.grant("saw", host.player);
-      host.refreshShadows();
     },
   },
   {
@@ -151,7 +148,6 @@ export const RECIPES: readonly Recipe[] = [
     done: ({ weapons }) => weapons.crafted("drone"),
     craft: (host) => {
       host.weapons.makeSwarm(host.player);
-      host.refreshShadows();
     },
   },
   {
@@ -211,7 +207,6 @@ export const RECIPES: readonly Recipe[] = [
       if (!pool.length) return;
       const pick = pool[Math.floor(Math.random() * pool.length)];
       host.weapons.grant(pick.id, host.player);
-      host.refreshShadows();
     },
   },
 ];

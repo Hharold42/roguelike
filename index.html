@@ -19,6 +19,10 @@
         display: block;
         outline: none;
         touch-action: none;
+        /* Ретро-апскейл: движок рендерит в низком разрешении (см. applyPixelScale),
+           браузер растягивает без сглаживания — чёткие пиксели */
+        image-rendering: crisp-edges;
+        image-rendering: pixelated;
       }
       #crosshair {
         position: fixed;
@@ -58,17 +62,17 @@
         left: 12px;
         color: #e8e8f0;
         font-family: 'Segoe UI', system-ui, sans-serif;
-        font-size: 18px;
+        font-size: 11px;
         user-select: none;
         pointer-events: none;
         text-shadow: 0 1px 3px #000;
-        line-height: 1.5;
+        line-height: 2;
       }
       #hud .hp { color: #ff5a6e; font-weight: 600; }
       #hud .stage { color: #ffd166; font-weight: 600; }
       #hud .goldRow { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
       #hud .goldLabel { color: #ffcf5a; font-weight: 600; }
-      #hud .goldText { font-size: 14px; opacity: 0.85; }
+      #hud .goldText { font-size: 9px; opacity: 0.85; }
       #goldBar {
         width: 160px;
         height: 10px;
@@ -83,8 +87,8 @@
         background: linear-gradient(90deg, #d69b1e, #ffe08a);
         transition: width 0.25s;
       }
-      #goldHint { display: none; font-size: 13px; color: #ffe08a; opacity: 0.9; max-width: 340px; line-height: 1.3; }
-      #hud .weapons { font-size: 13px; color: #8fd8ff; }
+      #goldHint { display: none; font-size: 9px; color: #ffe08a; opacity: 0.9; max-width: 340px; line-height: 1.6; }
+      #hud .weapons { font-size: 9px; color: #8fd8ff; }
       /* Сводка справа сверху: оружие, автоматика, статы, предметы, бафы */
       #statsHud {
         position: fixed;
@@ -105,6 +109,31 @@
       #statsHud .h:first-child { margin-top: 0; }
       #statsHud b { color: #fff; font-weight: 600; }
       #statsHud .buff { color: #9fe07a; }
+      /* Цель этапа по центру сверху: название + стрелка-компас + дистанция */
+      #objective {
+        position: fixed;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: none;
+        align-items: center;
+        gap: 10px;
+        color: #e8e8f0;
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        font-size: 11px;
+        user-select: none;
+        pointer-events: none;
+        text-shadow: 0 1px 3px #000;
+        white-space: nowrap;
+      }
+      #objArrow {
+        display: inline-block;
+        color: #ffd166;
+        font-size: 16px;
+        line-height: 1;
+        transition: transform 0.08s linear;
+      }
+      #objDist { color: #ffd166; font-weight: 600; }
       #flash {
         position: fixed;
         top: 18%;
@@ -113,7 +142,7 @@
         text-align: center;
         color: #ffd166;
         font-family: 'Segoe UI', system-ui, sans-serif;
-        font-size: 42px;
+        font-size: 22px;
         font-weight: 700;
         text-shadow: 0 2px 12px #000;
         user-select: none;
@@ -134,6 +163,13 @@
         user-select: none;
       }
       .screen h1 { font-size: 44px; margin: 0 0 8px; }
+      /* Пиксельный шрифт (Press Start 2P, локальный из @fontsource) — для крупного
+         текста и HUD; мелкий текст карточек остаётся в Segoe UI для читаемости */
+      .screen h1, #flash, #objective, #hud, .card h3 {
+        font-family: 'Press Start 2P', 'Segoe UI', monospace;
+      }
+      .screen h1 { font-size: 26px; }
+      .card h3 { font-size: 15px; }
       #overlay h1 { color: #ff5a6e; }
       .screen p { font-size: 20px; opacity: 0.8; }
       #upgradeCards, .cards {
@@ -298,7 +334,7 @@
       <div>Этап: <span class="stage" id="stage">1</span></div>
       <div>HP: <span class="hp" id="hp">100/100</span></div>
       <div>Врагов: <span id="enemies">0</span></div>
-      <div>Следующий этап: <span id="wave">0:30</span></div>
+      <div>Время: <span id="wave">0:30</span></div>
       <div class="goldRow">
         <span class="goldLabel">Золото</span>
         <div id="goldBar"><div id="goldFill"></div></div>
@@ -308,8 +344,9 @@
       <div id="goldHint"></div>
     </div>
     <div id="statsHud"></div>
+    <div id="objective"><span id="objArrow">▲</span><span id="objText"></span><span id="objDist"></span></div>
     <div id="crosshair"></div>
-    <div id="lockHint">Кликните по полю, чтобы захватить мышь · WASD — движение · пробел — прыжок · Ctrl / C — присед · мышь — камера · колесо — дистанция · ЛКМ — атака · B — колесо фортуны / магазин / крафт · Esc — отпустить</div>
+    <div id="lockHint">Кликните по полю, чтобы захватить мышь · WASD — движение · пробел — прыжок · Ctrl / C — присед · мышь — обзор · ЛКМ — атака · B — колесо фортуны / магазин / крафт · Esc — отпустить</div>
     <div id="flash"></div>
     <div id="overlay" class="screen">
       <h1>ВЫ ПОГИБЛИ</h1>

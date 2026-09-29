@@ -1,15 +1,14 @@
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
-import { CreateCapsule } from "@babylonjs/core/Meshes/Builders/capsuleBuilder";
-import type { Scene } from "@babylonjs/core/scene";
-import type { CharacterModel } from "./characterModel";
 import { clamp, type MotionState } from "./motion";
 import { WeaponStats } from "./weapon";
 
 export type HeightFn = (x: number, z: number) => number;
+/** Блокирует ли стена круг игрока (радиус PLAYER_RADIUS) в точке на заданной высоте ступней */
+export type BlockFn = (x: number, z: number, feetY: number) => boolean;
 
 const TURN_RATE = 14; // скорость доворота персонажа (1/с)
-const HALF_HEIGHT = 1.0; // центр капсулы над ступнями
+const HALF_HEIGHT = 1.0; // центр «капсулы» над ступнями
+export const PLAYER_RADIUS = 0.45; // горизонтальный радиус круга коллизий со стенами
 
 // --- Движение: скорость с инерцией, а не телепорт на dir*speed ---
 const GROUND_ACCEL = 16; // 1/с: разгон до ~90% за 0.15 с
@@ -35,7 +34,7 @@ const LAND_SLOW = 0.45; // при жёстком приземлении гори
 // --- Присед ---
 const CROUCH_SPEED_MULT = 0.5;
 const CROUCH_RATE = 10; // скорость перехода в присед и обратно (1/с)
-const CROUCH_COLLIDER = 0.35; // насколько ниже становится коллайдер
+const EYE_OFFSET = 0.85; // глаза над центром (ступни + 1.85 — чуть выше низкой стены 1.8)
 const CAMERA_CROUCH_DROP = 0.45; // насколько опускается точка обзора в приседе
 
 export interface PlayerActions {
@@ -49,10 +48,16 @@ export interface PlayerActions {
 
 const NO_ACTIONS: PlayerActions = { jump: false, jumpHeld: false, crouch: false };
 
+/**
+ * Игрок: точка (центр капсулы) + yaw. Вид от первого лица — модели нет,
+ * коллизии со стенами — точная проверка круга против отрисованных колонн
+ * стен (isBlocked приходит из game.ts) со скольжением по осям.
+ */
 export class Player {
-  /** Невидимый коллайдер-капсула: движение, коллизии, поворот. Модель — его дочерний узел. */
-  readonly mesh: Mesh;
-  model: CharacterModel | null = null;
+  /** Центр капсулы (ступни = y − 1) */
+  readonly position: Vector3;
+  /** Куда смотрит корпус (= азимут камеры в первом лице), рад */
+  yaw = 0;
 
   // --- Прокачиваемые статы (улучшения между этапами) ---
   hp = 100;
@@ -83,7 +88,7 @@ export class Player {
   /** 0 — стоим, 1 — полный присед (сглажено) */
   private crouchT = 0;
 
-  /** Состояние движения для анимации (обновляется в update) */
+  /** Состояние движения за кадр (камера-качание, вьюмодель) */
   readonly motion: MotionState = {
     moving: false,
     speed: 0,
@@ -96,18 +101,8 @@ export class Player {
     yawRate: 0,
   };
 
-  constructor(scene: Scene, start: Vector3) {
-    this.mesh = CreateCapsule("player", { height: 2, radius: 0.5 }, scene);
-    this.mesh.position = start.clone();
-    this.mesh.isVisible = false;
-    this.mesh.isPickable = false;
-
-    this.mesh.ellipsoid = new Vector3(0.5, HALF_HEIGHT, 0.5);
-    this.mesh.checkCollisions = true;
-  }
-
-  get position(): Vector3 {
-    return this.mesh.position;
+  constructor(start: Vector3) {
+    this.position = start.clone();
   }
 
   /** В воздухе ли персонаж */
@@ -120,18 +115,9 @@ export class Player {
     return this.crouchT;
   }
 
-  /** Точка, за которой следит камера: центр капсулы, в приседе — ниже */
-  cameraAnchor(): Vector3 {
-    const p = this.mesh.position;
-    return new Vector3(p.x, p.y - this.crouchT * CAMERA_CROUCH_DROP, p.z);
-  }
-
-  /** Подвесить визуальную модель к коллайдеру (ноги модели — у нижней точки капсулы) */
-  attachModel(model: CharacterModel): void {
-    this.model?.dispose();
-    this.model = model;
-    model.root.parent = this.mesh;
-    model.root.position.set(0, -HALF_HEIGHT, 0);
+  /** Высота глаз (мировая Y): центр + смещение, в приседе ниже, при приземлении — просадка */
+  eyeY(): number {
+    return this.position.y + EYE_OFFSET - this.crouchT * CAMERA_CROUCH_DROP - this.motion.land * 0.18;
   }
 
   /**
@@ -139,13 +125,21 @@ export class Player {
    * moveDir — мировое горизонтальное направление движения (уже с учётом камеры) или null;
    * faceYaw — куда повернуться (рад) или null, чтобы оставить текущий поворот;
    * getFloor — высота опоры в точке (верх стены или рельеф);
+   * isBlocked — блокирует ли стена круг игрока в точке на высоте ступней;
    * actions — прыжок/присед.
    */
-  update(dt: number, moveDir: Vector3 | null, faceYaw: number | null, getFloor: HeightFn, actions: PlayerActions = NO_ACTIONS): void {
+  update(
+    dt: number,
+    moveDir: Vector3 | null,
+    faceYaw: number | null,
+    getFloor: HeightFn,
+    isBlocked: BlockFn,
+    actions: PlayerActions = NO_ACTIONS,
+  ): void {
     if (this.regen > 0 && this.hp > 0) {
       this.hp = Math.min(this.maxHp, this.hp + this.regen * dt);
     }
-    const pos = this.mesh.position;
+    const pos = this.position;
 
     // --- Присед: только на земле ---
     const wantCrouch = actions.crouch && this.grounded;
@@ -168,17 +162,25 @@ export class Player {
     if (!wantMove && this.vel.lengthSquared() < 0.01) this.vel.set(0, 0, 0);
 
     if (this.vel.lengthSquared() > 0) {
-      const before = pos.clone();
-      // Стены — коллайдеры: сбоку в блок не войти, но когда ступни выше его верха — проходим над ним
-      this.mesh.moveWithCollisions(new Vector3(this.vel.x * dt, 0, this.vel.z * dt));
-      // Фактическое смещение = скорость: упёрлись в стену — скорость гаснет, а не «давит» дальше
-      if (dt > 0) {
-        this.vel.x = (pos.x - before.x) / dt;
-        this.vel.z = (pos.z - before.z) / dt;
+      const stepX = this.vel.x * dt;
+      const stepZ = this.vel.z * dt;
+      const feet = pos.y - HALF_HEIGHT;
+      // Полный ход, иначе скольжение вдоль стены по одной оси
+      if (!isBlocked(pos.x + stepX, pos.z + stepZ, feet)) {
+        pos.x += stepX;
+        pos.z += stepZ;
+      } else if (!isBlocked(pos.x + stepX, pos.z, feet)) {
+        pos.x += stepX;
+        this.vel.z = 0;
+      } else if (!isBlocked(pos.x, pos.z + stepZ, feet)) {
+        pos.z += stepZ;
+        this.vel.x = 0;
+      } else {
+        this.vel.set(0, 0, 0);
       }
     }
 
-    // --- Вертикаль. Опора — верх стены или рельеф под центром капсулы ---
+    // --- Вертикаль. Опора — верх стены или рельеф под центром ---
     const floorY = getFloor(pos.x, pos.z) + HALF_HEIGHT;
     this.jumpBuffer = actions.jump ? JUMP_BUFFER : this.jumpBuffer - dt;
     if (this.grounded) {
@@ -218,7 +220,7 @@ export class Player {
       if (Math.abs(this.vy) < APEX_VY) g *= APEX_GRAVITY;
       this.vy -= g * dt;
       pos.y += this.vy * dt;
-      // Приземление на опору под центром капсулы — рельеф или верх стены
+      // Приземление на опору под центром — рельеф или верх стены
       if (this.vy <= 0 && pos.y <= floorY + LAND_SNAP) {
         pos.y = floorY;
         this.grounded = true;
@@ -232,29 +234,24 @@ export class Player {
     }
     this.landT += dt;
 
-    // Коллайдер ниже в приседе
-    this.mesh.ellipsoid.y = HALF_HEIGHT - CROUCH_COLLIDER * this.crouchT;
-
     // --- Плавный доворот по кратчайшей дуге ---
     let yawRate = 0;
     if (faceYaw !== null) {
-      let delta = faceYaw - this.mesh.rotation.y;
+      let delta = faceYaw - this.yaw;
       delta = Math.atan2(Math.sin(delta), Math.cos(delta));
       const step = delta * Math.min(1, dt * TURN_RATE);
-      this.mesh.rotation.y += step;
+      this.yaw += step;
       if (dt > 0) yawRate = step / dt;
     }
 
-    // --- Состояние для анимации: по фактической скорости, а не по нажатым клавишам ---
-    const yaw = this.mesh.rotation.y;
-    const fx = Math.sin(yaw);
-    const fz = Math.cos(yaw);
+    // --- Состояние движения: по фактической скорости, а не по нажатым клавишам ---
+    const fx = Math.sin(this.yaw);
+    const fz = Math.cos(this.yaw);
     const forwardSpeed = this.vel.x * fx + this.vel.z * fz;
     const sideSpeed = this.vel.x * fz - this.vel.z * fx; // вправо положительно
     const hSpeed = Math.hypot(this.vel.x, this.vel.z);
     const m = this.motion;
     m.moving = hSpeed > 0.3;
-    // Идём спиной вперёд — ноги перебирают в обратную сторону
     m.speed = forwardSpeed < -0.2 * hSpeed ? -hSpeed : hSpeed;
     m.strafe = clamp(sideSpeed / Math.max(1, this.baseSpeed * this.speedMult), -1, 1);
     m.airborne = !this.grounded;
@@ -266,29 +263,14 @@ export class Player {
         : this.landImpulse * Math.max(0, 1 - (this.landT - LAND_ATTACK) / (LAND_RECOVERY - LAND_ATTACK));
     m.crouch = this.crouchT;
     m.yawRate = yawRate;
-
-    this.model?.update(dt, m);
   }
 
-  /** Направить оружие на мировую точку (после update) */
-  aim(target: Vector3): void {
-    this.model?.aim(target);
-  }
-
-  /** Замах оружейной руки вбок, рад (меч) */
-  swing(angle: number): void {
-    this.model?.swing(angle);
-  }
-
-  /** Откуда вылетают пули: срез ствола модели, иначе точка перед грудью */
+  /** Откуда вылетают пули: точка перед глазами по курсу */
   muzzle(): Vector3 {
-    const m = this.model?.muzzle();
-    if (m) return m;
-    const yaw = this.mesh.rotation.y;
     return new Vector3(
-      this.position.x + Math.sin(yaw) * 0.8,
-      this.position.y + 0.3,
-      this.position.z + Math.cos(yaw) * 0.8,
+      this.position.x + Math.sin(this.yaw) * 0.5,
+      this.eyeY(),
+      this.position.z + Math.cos(this.yaw) * 0.5,
     );
   }
 

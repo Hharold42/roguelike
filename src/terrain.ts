@@ -26,7 +26,7 @@ function hash2(ix: number, iz: number, seed: number): number {
 }
 
 /** Хеш целых координат -> целое (для сидирования генератора чанка) */
-function hash2i(ix: number, iz: number, seed: number): number {
+export function hash2i(ix: number, iz: number, seed: number): number {
   let h = Math.imul(ix, 374761393) ^ Math.imul(iz, 668265263) ^ Math.imul(seed, 974711);
   h = Math.imul(h ^ (h >>> 13), 1274126177);
   return h ^ (h >>> 16);
@@ -149,6 +149,62 @@ function hexKey(q: number, r: number): number {
   return ((q & 0xffff) << 16) | (r & 0xffff);
 }
 
+// ---------- Мегаструктуры: макро-регионы ----------
+
+/** Регион — квадрат 8×8 чанков (256 юнитов); в регионе стоит не больше одной мегаструктуры */
+export const REGION_CHUNKS = 8;
+export const REGION_SIZE = REGION_CHUNKS * CHUNK_SIZE;
+const REGION_SEED_SALT = 0x51f07a;
+/** Вероятность сооружения в регионе (регион спавна всегда пуст) */
+const STRUCTURE_CHANCE = 0.55;
+/** Отступ подошвы от границ региона */
+const STRUCTURE_MARGIN = 12;
+
+// Зиккурат: квадратные ярусы — ступени ровно в полный прыжок
+const ZIG_HALF = 105; // полуширина основания (210×210)
+const ZIG_TIERS = 50;
+const ZIG_TIER_H = 1.8; // высота яруса — берётся полным прыжком (2.2)
+const ZIG_TIER_DEPTH = 2; // глубина яруса — одна колонна карты
+const ZIG_RAMP_HALF_W = 4; // пандус: полоса 8 юнитов от подошвы до вершины
+
+// Монолит: вертикальная плита-ориентир
+const MON_HX_MIN = 8;
+const MON_HX_RND = 8; // полуширина 8–16
+const MON_HZ_MIN = 24;
+const MON_HZ_RND = 14; // полуглубина 24–38
+const MON_H_MIN = 110;
+const MON_H_RND = 70; // высота 110–180
+
+export type StructureKind = "ziggurat" | "monolith";
+
+export interface Structure {
+  kind: StructureKind;
+  /** Центр подошвы */
+  cx: number;
+  cz: number;
+  /** Высота рельефа под центром — от неё отсчитываются ярусы/высота */
+  baseY: number;
+  /** Зиккурат: полуширина основания, число ярусов, высота и глубина яруса */
+  half: number;
+  tiers: number;
+  tierH: number;
+  tierDepth: number;
+  /** Сторона пандуса: 0 → +X, 1 → −X, 2 → +Z, 3 → −Z (−1 — нет) */
+  rampSide: number;
+  rampHalfW: number;
+  /** Монолит: полуоси и высота плиты */
+  halfX: number;
+  halfZ: number;
+  height: number;
+  /** Верх над baseY (для теней и целей) */
+  topH: number;
+  /** BBox подошвы (тени, поиск) */
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
 // ---------- Данные ----------
 
 /** Один блок стены — шестигранная призма */
@@ -259,14 +315,16 @@ export class Terrain {
     return data;
   }
 
-  /** Стена ли в абсолютной клетке */
+  /** Стена ли в абсолютной клетке (включая твёрдые части мегаструктур — для flow field и точек спавна) */
   isWall(cellX: number, cellZ: number): boolean {
     const cx = Terrain.chunkOfCell(cellX);
     const cz = Terrain.chunkOfCell(cellZ);
     const data = this.getChunk(cx, cz);
     const lx = cellX - cx * CHUNK_CELLS;
     const lz = cellZ - cz * CHUNK_CELLS;
-    return data.wallMask[lz * CHUNK_CELLS + lx] === 1;
+    if (data.wallMask[lz * CHUNK_CELLS + lx] === 1) return true;
+    const st = this.structureAt((cellX + 0.5) * TILE, (cellZ + 0.5) * TILE);
+    return st !== null && !st.ramp;
   }
 
   /** Блок стены с осевыми координатами (q, r) или null. Блок принадлежит чанку, где лежит его центр. */
@@ -276,22 +334,201 @@ export class Terrain {
     return data.hexSet.get(hexKey(q, r)) ?? null;
   }
 
-  /** Стена ли в мировой точке — точная проверка по геометрии шестиугольника (для снарядов) */
-  isWallAt(wx: number, wz: number): boolean {
-    const h = hexAt(wx, wz);
-    return this.hexWall(h.q, h.r) !== null;
-  }
-
-  /** Высота верха стены (мировой Y) в точке или null, если стены нет — для камеры и пуль */
-  wallTopAt(wx: number, wz: number): number | null {
+  /** Верх hex-стены в точке или null (без мегаструктур) */
+  private hexTopAt(wx: number, wz: number): number | null {
     const h = hexAt(wx, wz);
     const wall = this.hexWall(h.q, h.r);
     return wall ? this.getHeight(wall.x, wall.z) + wall.height : null;
   }
 
-  /** Высота опоры в точке: верх стены, если она там есть, иначе рельеф — по ней ходит игрок */
+  /** Стена ли в мировой точке: hex-блок или твёрдая часть сооружения (пандус проходим) — для врагов */
+  isWallAt(wx: number, wz: number): boolean {
+    return this.blocksAt(wx, wz) !== null;
+  }
+
+  /**
+   * Высота верха преграды (мировой Y) в точке или null: hex-стена или мегаструктура,
+   * включая пандусы — это «твёрдая поверхность над рельефом», для пуль и опоры.
+   */
+  wallTopAt(wx: number, wz: number): number | null {
+    const hexTop = this.hexTopAt(wx, wz);
+    const st = this.structureAt(wx, wz);
+    if (st === null) return hexTop;
+    return hexTop !== null ? Math.max(hexTop, st.top) : st.top;
+  }
+
+  /** Верх блокирующей преграды в точке (стены и твёрдые части сооружений; пандус не блокирует) или null */
+  blocksAt(wx: number, wz: number): number | null {
+    const st = this.structureAt(wx, wz);
+    const hexTop = this.hexTopAt(wx, wz);
+    if (st === null || st.ramp) return hexTop;
+    return hexTop !== null ? Math.max(hexTop, st.top) : st.top;
+  }
+
+  /** Высота опоры в точке: верх стены/сооружения, если она там есть, иначе рельеф — по ней ходит игрок */
   floorAt(wx: number, wz: number): number {
     return this.wallTopAt(wx, wz) ?? this.getHeight(wx, wz);
+  }
+
+  /**
+   * Биом «влажности» в точке, 0..1 — низкочастотный шум масштабом ~90 юнитов.
+   * Используется рендером для плавной тонировки земли (выжженное ↔ сырое).
+   */
+  biomeAt(wx: number, wz: number): number {
+    return fbm(wx * 0.011, wz * 0.011, this.seed ^ 0x5b10, 3);
+  }
+
+  // ----- Мегаструктуры -----
+
+  private structures = new Map<number, Structure | null>();
+  /** Мемо последнего региона: запросы идут плотными кластерами по соседним точкам */
+  private lastRegionKey = -1;
+  private lastRegionStruct: Structure | null = null;
+
+  /** Сооружение региона (детерминированно из сида) или null */
+  structureInRegion(rx: number, rz: number): Structure | null {
+    const key = chunkKey(rx, rz);
+    if (key === this.lastRegionKey) return this.lastRegionStruct;
+    let s = this.structures.get(key);
+    if (s === undefined) {
+      s = this.generateStructure(rx, rz);
+      this.structures.set(key, s);
+    }
+    this.lastRegionKey = key;
+    this.lastRegionStruct = s;
+    return s;
+  }
+
+  /**
+   * Сооружение в мировой точке: высота верха и признак пандуса (проходимого склона);
+   * null — сооружения нет. Аналитически, без hex-квантования.
+   */
+  structureAt(wx: number, wz: number): { top: number; ramp: boolean } | null {
+    const s = this.structureInRegion(Math.floor(wx / REGION_SIZE), Math.floor(wz / REGION_SIZE));
+    if (!s || wx < s.minX || wx > s.maxX || wz < s.minZ || wz > s.maxZ) return null;
+    if (s.kind === "monolith") return { top: s.baseY + s.height, ramp: false };
+    // Зиккурат: ярусы по чебышёвской дистанции от центра
+    const dx = Math.abs(wx - s.cx);
+    const dz = Math.abs(wz - s.cz);
+    const d = Math.max(dx, dz);
+    if (d > s.half) return null;
+    // Пандус: полоса на одной стороне от подошвы до края плато (плато остаётся твёрдой
+    // вершиной), непрерывный склон с тем же уклоном, что у ярусов
+    const along =
+      s.rampSide === 0 ? wx - s.cx : s.rampSide === 1 ? s.cx - wx : s.rampSide === 2 ? wz - s.cz : s.cz - wz;
+    const across = s.rampSide <= 1 ? dz : dx;
+    const plateau = s.half - s.tiers * s.tierDepth;
+    if (along > plateau && across <= s.rampHalfW) {
+      const slope = s.tierH / s.tierDepth;
+      return { top: s.baseY + Math.min(s.topH, (s.half - along) * slope), ramp: true };
+    }
+    const tier = Math.min(s.tiers, Math.floor((s.half - d) / s.tierDepth) + 1);
+    return { top: s.baseY + tier * s.tierH, ramp: false };
+  }
+
+  /** Ближайшее сооружение заданного типа с центром в кольце [minDist, maxDist] от точки */
+  nearestStructure(x: number, z: number, minDist: number, maxDist: number, kind?: StructureKind): Structure | null {
+    const rx0 = Math.floor((x - maxDist) / REGION_SIZE);
+    const rx1 = Math.floor((x + maxDist) / REGION_SIZE);
+    const rz0 = Math.floor((z - maxDist) / REGION_SIZE);
+    const rz1 = Math.floor((z + maxDist) / REGION_SIZE);
+    let best: Structure | null = null;
+    let bestD = Infinity;
+    for (let rz = rz0; rz <= rz1; rz++) {
+      for (let rx = rx0; rx <= rx1; rx++) {
+        const s = this.structureInRegion(rx, rz);
+        if (!s || (kind && s.kind !== kind)) continue;
+        const d = Math.hypot(s.cx - x, s.cz - z);
+        if (d < minDist || d > maxDist || d >= bestD) continue;
+        best = s;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  /** Может ли сооружение отбрасывать тень на тайл чанка (сооружение в пределах reach юнитов) */
+  structureNearTile(tx: number, tz: number, reach: number): boolean {
+    const x0 = tx * CHUNK_SIZE - reach;
+    const x1 = (tx + 1) * CHUNK_SIZE + reach;
+    const z0 = tz * CHUNK_SIZE - reach;
+    const z1 = (tz + 1) * CHUNK_SIZE + reach;
+    const rx0 = Math.floor(x0 / REGION_SIZE);
+    const rx1 = Math.floor(x1 / REGION_SIZE);
+    const rz0 = Math.floor(z0 / REGION_SIZE);
+    const rz1 = Math.floor(z1 / REGION_SIZE);
+    for (let rz = rz0; rz <= rz1; rz++) {
+      for (let rx = rx0; rx <= rx1; rx++) {
+        const s = this.structureInRegion(rx, rz);
+        if (s && s.maxX >= x0 && s.minX <= x1 && s.maxZ >= z0 && s.minZ <= z1) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Генерация сооружения региона: детерминированно, подошва целиком внутри региона */
+  private generateStructure(rx: number, rz: number): Structure | null {
+    // Регион спавна всегда пуст
+    if (rx === Math.floor(this.spawn.x / REGION_SIZE) && rz === Math.floor(this.spawn.z / REGION_SIZE)) return null;
+    const rand = mulberry32(hash2i(rx, rz, this.seed ^ REGION_SEED_SALT));
+    if (rand() >= STRUCTURE_CHANCE) return null;
+    const rcx = (rx + 0.5) * REGION_SIZE;
+    const rcz = (rz + 0.5) * REGION_SIZE;
+    if (rand() < 0.6) {
+      // Зиккурат
+      const half = ZIG_HALF;
+      const free = REGION_SIZE / 2 - half - STRUCTURE_MARGIN;
+      const cx = rcx + (rand() * 2 - 1) * free;
+      const cz = rcz + (rand() * 2 - 1) * free;
+      return {
+        kind: "ziggurat",
+        cx,
+        cz,
+        baseY: this.getHeight(cx, cz),
+        half,
+        tiers: ZIG_TIERS,
+        tierH: ZIG_TIER_H,
+        tierDepth: ZIG_TIER_DEPTH,
+        rampSide: Math.floor(rand() * 4),
+        rampHalfW: ZIG_RAMP_HALF_W,
+        halfX: 0,
+        halfZ: 0,
+        height: 0,
+        topH: ZIG_TIERS * ZIG_TIER_H,
+        minX: cx - half,
+        maxX: cx + half,
+        minZ: cz - half,
+        maxZ: cz + half,
+      };
+    }
+    // Монолит
+    const halfX = MON_HX_MIN + rand() * MON_HX_RND;
+    const halfZ = MON_HZ_MIN + rand() * MON_HZ_RND;
+    const hx = rand() < 0.5 ? halfX : halfZ; // поворот на 90°
+    const hz = hx === halfX ? halfZ : halfX;
+    const height = MON_H_MIN + rand() * MON_H_RND;
+    const cx = rcx + (rand() * 2 - 1) * (REGION_SIZE / 2 - hx - STRUCTURE_MARGIN);
+    const cz = rcz + (rand() * 2 - 1) * (REGION_SIZE / 2 - hz - STRUCTURE_MARGIN);
+    return {
+      kind: "monolith",
+      cx,
+      cz,
+      baseY: this.getHeight(cx, cz),
+      half: 0,
+      tiers: 0,
+      tierH: 0,
+      tierDepth: 0,
+      rampSide: -1,
+      rampHalfW: 0,
+      halfX: hx,
+      halfZ: hz,
+      height,
+      topH: height,
+      minX: cx - hx,
+      maxX: cx + hx,
+      minZ: cz - hz,
+      maxZ: cz + hz,
+    };
   }
 
   /** Забыть данные чанков дальше radius (в чанках) от центра — чтобы кеш не рос бесконечно */
@@ -305,20 +542,24 @@ export class Terrain {
 
   /**
    * Случайная открытая точка (не стена) на расстоянии [minDist, maxDist] от заданной.
-   * Возвращает центр клетки.
+   * Возвращает центр клетки. Если кольцо целиком занято (игрок на вершине
+   * зиккурата — вокруг одни ярусы), кольцо расширяется, пока не найдётся земля.
    */
   randomOpenPoint(
     from: { x: number; z: number },
     minDist: number,
     maxDist: number,
   ): { x: number; z: number } {
-    for (let attempt = 0; attempt < 300; attempt++) {
-      const angle = Math.random() * Math.PI * 2;
-      const dist = minDist + Math.random() * (maxDist - minDist);
-      const cx = Terrain.cellOf(from.x + Math.cos(angle) * dist);
-      const cz = Terrain.cellOf(from.z + Math.sin(angle) * dist);
-      if (this.isWall(cx, cz)) continue;
-      return { x: (cx + 0.5) * TILE, z: (cz + 0.5) * TILE };
+    for (let round = 0; round < 4; round++) {
+      const maxD = maxDist * (1 + round * 0.75);
+      for (let attempt = 0; attempt < 300; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = minDist + Math.random() * (maxD - minDist);
+        const cx = Terrain.cellOf(from.x + Math.cos(angle) * dist);
+        const cz = Terrain.cellOf(from.z + Math.sin(angle) * dist);
+        if (this.isWall(cx, cz)) continue;
+        return { x: (cx + 0.5) * TILE, z: (cz + 0.5) * TILE };
+      }
     }
     return { x: from.x + minDist, z: from.z };
   }
@@ -347,11 +588,12 @@ export class Terrain {
     const maxZ = (cz + 1) * CHUNK_SIZE - HEX_SPACING;
     const spawnClear = SPAWN_CLEAR_CELLS * TILE;
 
-    /** Можно ли поставить блок в (q, r): внутри допустимой зоны, не у спавна, не занято */
+    /** Можно ли поставить блок в (q, r): внутри допустимой зоны, не у спавна, не занято, не в сооружении */
     const allowed = (q: number, r: number): boolean => {
       if (hexSet.has(hexKey(q, r))) return false;
       const c = hexCenter(q, r);
       if (c.x < minX || c.x >= maxX || c.z < minZ || c.z >= maxZ) return false;
+      if (this.structureAt(c.x, c.z) !== null) return false; // валуны не растут сквозь мегаструктуры
       return Math.hypot(c.x - this.spawn.x, c.z - this.spawn.z) >= spawnClear + HEX_R;
     };
 
