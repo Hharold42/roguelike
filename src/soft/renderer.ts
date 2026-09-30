@@ -13,16 +13,20 @@
  * горизонтальному следу своей лучевой плоскости, а высоты проецируются через
  * настоящие fd/ud пинхол-камеры — мир поворачивается, а не «сползает».
  * Прицеливание согласовано (см. aimDir в game.ts — тот же базис камеры).
+ *
+ * Трава — отдельный слой (grass.ts): поле колосков, детерминированных от
+ * мировых координат; рисуется после мира с попиксельным z-test, кончики
+ * качаются ветром (бегущая волна + порывы), колоски отклоняются от
+ * проходящих акторов (trample) и распрямляются за пару секунд.
  */
 
 import { ColumnMap, FOG_COL, SKY_TOP, STRUCT_COL, SUN_X, SUN_Z, WALL_COL } from "./columnMap";
 import type { GroundSample } from "./columnMap";
+import { GrassField } from "./grass";
+import { BAYER, FOG_LUT, LEVELS, Z_FAR } from "./gfx";
 import type { Sprite } from "./sprites";
 
 const Z_NEAR = 0.5;
-const Z_FAR = 170; // дальше — сплошной туман
-const FOG_K = 0.016;
-const LEVELS = 6; // градаций на канал
 const HFOV = (74 * Math.PI) / 180;
 const TARGET_HEIGHT = 240; // внутреннее разрешение по вертикали (ширина — по пропорциям окна)
 
@@ -32,16 +36,6 @@ const BOLT_LIFE = 0.18;
 const BLAST_LIFE = 0.35;
 const CORPSE_LIFE = 0.4;
 const ARC_LIFE = 0.22; // сектор взмаха меча
-
-// Матрица Байера 4×4
-const BAYER = new Float32Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16));
-
-// Туман — таблица, чтобы не звать exp в горячем цикле
-const FOG_LUT = new Float32Array(512);
-for (let i = 0; i < 512; i++) {
-  const z = (i / 511) * Z_FAR * FOG_K;
-  FOG_LUT[i] = 1 - Math.exp(-z * z);
-}
 
 /**
  * Крапчатая текстура земли: детерминированный хеш от мировых координат,
@@ -144,6 +138,11 @@ export class SoftRenderer {
   private cosP = 1;
   private horizonSy = 0; // экранная строка истинного горизонта (для неба и солнца)
 
+  /** Время кадра, с: распрямление травы. Выставлять ДО trample() и begin() */
+  time = 0;
+  /** Поле колосков травы (отдельный слой поверх мира, до спрайтов) */
+  private readonly grass: GrassField;
+
   // Очереди кадра
   private sprites: QueuedSprite[] = [];
   private streaks: { x1: number; y1: number; z1: number; x2: number; y2: number; z2: number; r: number; g: number; b: number }[] = [];
@@ -161,6 +160,7 @@ export class SoftRenderer {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
     this.map = map;
+    this.grass = new GrassField(map);
     this.resize();
   }
 
@@ -210,6 +210,9 @@ export class SoftRenderer {
     this.flashAlpha = 0;
     this.renderSky();
     this.renderWorld();
+    // Трава — поверх мира с попиксельным z-test, до спрайтов (они тонут в ней)
+    this.grass.time = this.time;
+    this.grass.render(this.pix, this.zbuf, this.W, this.H, this.focal, camX, camY, camZ, this.sinY, this.cosY, this.sinP, this.cosP);
   }
 
   /** Поставить спрайт в очередь кадра (рисуются в end, дальние первыми) */
@@ -240,6 +243,15 @@ export class SoftRenderer {
   /** Красная виньетка урона, alpha 0..1 на этот кадр */
   damageFlash(alpha: number): void {
     this.flashAlpha = alpha;
+  }
+
+  /**
+   * Отпечаток актора в траве: колоски кругом радиуса r отклоняются от точки
+   * (x, z) и распрямляются за ~1–2 с. Вызывать каждый кадр для каждого
+   * существа рядом с камерой. См. grass.ts.
+   */
+  trample(x: number, z: number, r: number): void {
+    this.grass.trample(x, z, r);
   }
 
   // --- Эффекты с временем жизни ---
@@ -318,22 +330,27 @@ export class SoftRenderer {
     const sinP = this.sinP;
     const cosP = this.cosP;
     const halfH = H / 2;
+    // Вектор right камеры (горизонтален): сдвиг вдоль него меняет только
+    // латеральную координату точки — основа ньютоновской поправки ниже
+    const rightX = this.cosY;
+    const rightZ = -this.sinY;
     for (let x = 0; x < W; x++) {
       const u = (x - W / 2) / focal;
       // Направление марша — горизонтальный след лучевой плоскости столбца;
       // при наклоне камеры шаг по земле сжимается на cosP (истинный pitch)
       const dirX = this.sinY + u * this.cosY * cosP;
       const dirZ = this.cosY - u * this.sinY * cosP;
+      const uSinP = u * sinP;
       let yb = H;
       let t = Z_NEAR;
       const brow = x & 3;
       while (t < Z_FAR && yb > 0) {
-        const wx = this.camX + dirX * t;
-        const wz = this.camZ + dirZ * t;
-        const ci = map.columnIndexAt(wx, wz);
+        let wx = this.camX + dirX * t;
+        let wz = this.camZ + dirZ * t;
+        let ci = map.columnIndexAt(wx, wz);
         // Блоками рисуются только мегаструктуры (брутализм — стиль); земля и
         // валуны — билинейно сглажены: плавные холмы и скруглённые скалы.
-        const solid = ci >= 0 && colKind[ci] >= 2;
+        let solid = ci >= 0 && colKind[ci] >= 2;
         let h: number;
         if (solid) {
           h = colH[ci];
@@ -344,9 +361,28 @@ export class SoftRenderer {
           }
           h = GS.h;
         }
+        let dh = h - this.camY;
+        // Ньютоновская поправка: при pitch ≠ 0 точка горизонтального следа не
+        // лежит в наклонной лучевой плоскости столбца (боковая ошибка
+        // δ = u·Δh·sinP — мир «плывёт» к краям). Досдвигаем точку вдоль right
+        // на δ — она оказывается точно в своей плоскости: пиксель-в-пиксель
+        // пинхол-камера при любом наклоне. При ровном взгляде поправка нулевая.
+        const corr = uSinP * dh;
+        if (corr > 0.02 || corr < -0.02) {
+          wx += rightX * corr;
+          wz += rightZ * corr;
+          ci = map.columnIndexAt(wx, wz);
+          if (ci >= 0 && colKind[ci] >= 2) {
+            solid = true;
+            h = colH[ci];
+          } else if (map.sampleGround(wx, wz, GS)) {
+            solid = false;
+            h = GS.h;
+          } // незапечённое — остаёмся на нескорректированной высоте
+          dh = h - this.camY;
+        }
         // Истинная проекция пинхол-камеры с наклоном: fd — дальность вперёд,
         // ud — высота над плоскостью взгляда (см. project — тот же базис)
-        const dh = h - this.camY;
         const fd = t * cosP + dh * sinP;
         if (fd < 0.05) {
           t += 0.12 + t * 0.02;

@@ -86,7 +86,7 @@ const BULLET_BLAST_MULT = 0.5; // урон взрыва пули (гранато
 // --- Камера первого лица ---
 const MOUSE_SENS = 0.0023; // рад yaw на пиксель мыши
 const PITCH_SENS = 0.0023; // рад на пиксель мыши (как MOUSE_SENS)
-const PITCH_MAX = 1.0; // рад (~57°) вверх/вниз — дальше voxel-проекция теряет смысл
+const PITCH_MAX = 1.15; // рад (~66°) вверх/вниз — с ньютоновской поправкой проекция точная
 const BOB_FREQ = 1.9; // частота покачивания камеры при беге
 const BOB_AMP = 0.045; // амплитуда по вертикали, юниты
 const MUZZLE_FLASH_TIME = 0.06; // с, вспышка выстрела на вьюмодели
@@ -1283,6 +1283,18 @@ export class Game {
     // FOV-кик рывка: быстрый всплеск, квадратичное затухание (~0.3 с)
     this.fovKick = Math.max(0, this.fovKick - dt * 3.2);
     r.fovScale = 1 + 0.13 * this.fovKick * this.fovKick;
+    // Трава: часы ветра и следы приминания — до begin: мир рисуется внутри него.
+    // Далёких врагов не топчем: их клетки вне дальности прорисовки травы,
+    // а слоты сетки приминания меньше мусорят
+    r.time = this.time;
+    const pp = this.player.position;
+    r.trample(pp.x, pp.z, 1.2);
+    for (const e of this.enemies) {
+      if (!e.alive) continue;
+      const ex = e.node.position.x - pp.x;
+      const ez = e.node.position.z - pp.z;
+      if (ex > -40 && ex < 40 && ez > -40 && ez < 40) r.trample(e.node.position.x, e.node.position.z, 0.9);
+    }
     r.begin(eye.x, eye.y, eye.z, this.camYaw, this.pitch);
 
     // Враги — спрайты: кадр ходьбы по фазе, замах — атакующий кадр

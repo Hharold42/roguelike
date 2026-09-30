@@ -235,6 +235,17 @@ export function chunkKey(cx: number, cz: number): number {
   return ((cx & 0xffff) << 16) | (cz & 0xffff);
 }
 
+/** Переключатели генерации (песочница /gen и будущие биомы) */
+export interface TerrainOptions {
+  /** Рельеф: холмы и возвышенности (false — плоский мир) */
+  hills: boolean;
+  /** Hex-валуны (стены-цепочки) */
+  walls: boolean;
+  /** Мегаструктуры (зиккураты, монолиты) */
+  structures: boolean;
+}
+const DEFAULT_TERRAIN_OPTIONS: TerrainOptions = { hills: true, walls: true, structures: true };
+
 /**
  * Бесконечный террейн. Высота — чистая функция от мировых координат (шум),
  * стены — детерминированно генерируются по чанкам и кешируются лениво.
@@ -244,11 +255,13 @@ export class Terrain {
   /** Точка спавна игрока: начало координат, там всегда ровно и без стен */
   readonly spawn = { x: 0, z: 0 };
   readonly seed: number;
+  readonly opts: TerrainOptions;
 
   private chunks = new Map<number, ChunkData>();
 
-  constructor(seed = Math.floor(Math.random() * 1e9)) {
+  constructor(seed = Math.floor(Math.random() * 1e9), options: Partial<TerrainOptions> = {}) {
     this.seed = seed;
+    this.opts = { ...DEFAULT_TERRAIN_OPTIONS, ...options };
   }
 
   // ----- Координаты -----
@@ -272,6 +285,7 @@ export class Terrain {
 
   /** Высота вершины сетки (ix, iz) — узлы сетки идут с шагом TILE */
   vertexHeight(ix: number, iz: number): number {
+    if (!this.opts.hills) return 0; // плоский мир (песочница генерации)
     const wx = ix * TILE;
     const wz = iz * TILE;
     let h = (fbm(wx * HILL_FREQ, wz * HILL_FREQ, this.seed) - 0.5) * 2 * HILL_AMPLITUDE;
@@ -387,6 +401,7 @@ export class Terrain {
 
   /** Сооружение региона (детерминированно из сида) или null */
   structureInRegion(rx: number, rz: number): Structure | null {
+    if (!this.opts.structures) return null;
     const key = chunkKey(rx, rz);
     if (key === this.lastRegionKey) return this.lastRegionStruct;
     let s = this.structures.get(key);
@@ -618,7 +633,7 @@ export class Terrain {
       this.rasterizeHex(wall, cx, cz, wallMask);
     };
 
-    const chains = CHAINS_MIN + Math.floor(rand() * (CHAINS_MAX - CHAINS_MIN + 1));
+    const chains = this.opts.walls ? CHAINS_MIN + Math.floor(rand() * (CHAINS_MAX - CHAINS_MIN + 1)) : 0;
     for (let c = 0; c < chains; c++) {
       // Старт: свободный блок без соседей-стен
       let start: { q: number; r: number } | null = null;

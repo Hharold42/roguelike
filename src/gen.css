@@ -1,0 +1,55 @@
+/* Песочница генерации (/gen): полноэкранный пиксельный канвас + отладка */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0a0a0f;
+}
+
+#renderCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  touch-action: none;
+  /* Ретро-апскейл без сглаживания — чёткие пиксели */
+  image-rendering: crisp-edges;
+  image-rendering: pixelated;
+}
+
+#debug {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  color: #e8e8f0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 1.7;
+  user-select: none;
+  pointer-events: none;
+  text-shadow: 0 1px 3px #000;
+  opacity: 0.85;
+  white-space: pre;
+}
+
+#debug b {
+  color: #ffd166;
+}
+
+#lockHint {
+  position: fixed;
+  bottom: 36px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: #e8e8f0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  opacity: 0.75;
+  text-shadow: 0 1px 3px #000;
+  user-select: none;
+  pointer-events: none;
+}
