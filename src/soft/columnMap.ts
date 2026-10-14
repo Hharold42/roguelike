@@ -1,27 +1,29 @@
 /**
- * Потоковая карта колонн для софтверного рендера: мир Terrain запекается в
- * «высотные столбцы» (одна колонна на клетку 2×2 юнита): высота верха (рельеф
- * или верх стены), тип (земля/стена) и запечённое освещение — склон по нормали
- * рельефа плюс тень от стен и холмов (марш луча к солнцу по фартуку тайла).
+ * Карта колонн для софтверного рендера: рельеф Terrain запекается в «высотные
+ * столбцы» (одна колонна на клетку 2×2 юнита): высота, запечённое освещение
+ * (склон по нормали рельефа плюс тени от холмов — марш луча к низкому закатному
+ * солнцу по фартуку тайла) и базовый цвет земли (палитра высот + биом + снег).
  *
- * Хранение — тороидальное окно WINDOW×WINDOW тайлов вокруг камеры: тайл,
- * вышедший из окна, затирается новым без всяких очередей удаления. Радиуса
- * окна хватает за пределы дальности тумана, поэтому «дыр» в кадре не видно.
+ * Мир фиксированный: WORLD_TILES×WORLD_TILES чанков (8×8 = 256×256 юнитов),
+ * центр — точка спавна (0, 0). Все тайлы запекаются один раз на старте
+ * (bakeWorld), потоковой подгрузки нет. За границей мира колонн нет —
+ * рендер оставляет там дымку в цвете тумана (мир-остров в молоке).
  */
 
-import { CHUNK_CELLS, TILE, Terrain, chunkKey, hash2i } from "../terrain";
+import { CHUNK_CELLS, TILE, Terrain } from "../terrain";
 
-export const CELL = TILE; // 2 юнита на колонку
+export const CELL = TILE; // 2 юнита на колонну
 export const TILE_CELLS = CHUNK_CELLS; // 16 колонок в тайле (тайл = чанк террейна, 32 юнита)
-export const WINDOW = 15; // тайлов по стороне окна (15×32 = 480 юнитов покрытия)
-const VIEW_RADIUS = 7; // тайлов от камеры, которые обязаны быть запечены
+export const WORLD_TILES = 8; // чанков по стороне мира
+const WORLD_HALF = WORLD_TILES / 2; // тайлы: -4..3
+export const WORLD_SIZE = WORLD_TILES * TILE_CELLS * CELL; // 256 юнитов
 const SLOT_CELLS = TILE_CELLS * TILE_CELLS;
 const APRON = 8; // клеток вокруг тайла для нормалей и теней
 const APRON_N = TILE_CELLS + APRON * 2;
 
-// Солнце — то же, что в закатном свете игры: lightDir (0.7, -0.55, 0.3)
+// Солнце — низкое закатное: направление К солнцу
 const SUN_LEN = Math.hypot(0.7, 0.55, 0.3);
-export const SUN_X = -0.7 / SUN_LEN; // направление К солнцу
+export const SUN_X = -0.7 / SUN_LEN;
 export const SUN_Y = 0.55 / SUN_LEN;
 export const SUN_Z = -0.3 / SUN_LEN;
 // Горизонтальная составляющая марша тени и подъём луча на клетку
@@ -29,20 +31,13 @@ const SUN_HLEN = Math.hypot(SUN_X, SUN_Z);
 const SHADOW_DIR_X = SUN_X / SUN_HLEN;
 const SHADOW_DIR_Z = SUN_Z / SUN_HLEN;
 const SUN_RISE = (SUN_Y / SUN_HLEN) * CELL; // на сколько выше луч через клетку
-const SHADOW_STEPS = 7; // дальше тень не достаёт (стены ≤ 5.6 юнита)
+const SHADOW_STEPS = 7; // дальше тень от холма не достаёт
 const SHADOW_LIGHT = 0.35; // доля света в тени
-// Длинные тени от мегаструктур: марш с растущим шагом до 130 клеток (260 юнитов —
-// хватает на тень от монолита 180 юнитов при низком солнце)
-const SHADOW_REACH_CELLS = 130;
-const SHADOW_REACH_UNITS = SHADOW_REACH_CELLS * CELL;
 
-// Цвета (как в ретро-пайплайне игры)
+// Цвета
 export const FOG_COL: [number, number, number] = [0.66, 0.58, 0.62];
 export const SKY_TOP: [number, number, number] = [0.3, 0.27, 0.45];
-export const WALL_COL: [number, number, number] = [0.49, 0.47, 0.55];
-/** Мегаструктуры — холоднее и темнее валунов: мёртвый бетон гигантов */
-export const STRUCT_COL: [number, number, number] = [0.4, 0.41, 0.5];
-/** Палитра земли — полосы высот из terrainMesh.ts */
+/** Палитра земли — полосы по высоте */
 export const GROUND_PALETTE: { upTo: number; c: [number, number, number] }[] = [
   { upTo: -1.6, c: [0.12, 0.27, 0.17] },
   { upTo: 0.3, c: [0.2, 0.42, 0.19] },
@@ -63,7 +58,7 @@ const SNOW_TO = 5.2;
 
 /**
  * Цвет земли в точке: полосы палитры с плавными переходами, тонировка биомом
- * и снег на вершинах. Пишет RGB 0..1 в out по смещению o.
+ * и снег на вершинах. Пишет RGB 0..255 в out по смещению o.
  */
 function groundBaseColor(h: number, biome: number, out: Uint8Array, o: number): void {
   // Плавные полосы: каждая граница — лерп шириной BAND_SOFT
@@ -96,78 +91,64 @@ function groundBaseColor(h: number, biome: number, out: Uint8Array, o: number): 
   out[o + 2] = (b * 255) | 0;
 }
 
-// Общие scratch-буферы запекания (переиспользуются между тайлами, без GC)
+// Общий scratch-буфер запекания (переиспользуется между тайлами, без GC)
 const apronH = new Float32Array(APRON_N * APRON_N);
-const apronKind = new Uint8Array(APRON_N * APRON_N);
 
 /** Результат билинейного сэмпла рельефа (см. ColumnMap.sampleGround) */
 export interface GroundSample {
-  h: number; // сглаженная высота поверхности (земля + скруглённые валуны)
-  ground: number; // сглаженная высота чистого рельефа (для оттенка скал)
+  h: number; // сглаженная высота поверхности
   light: number; // 0..1
   rgb: [number, number, number]; // базовый цвет земли 0..1
 }
-/** Scratch для вызовов heightAt/sampleGround вне горячего цикла рендера */
-const GROUND_SCRATCH: GroundSample = { h: 0, ground: 0, light: 0, rgb: [0, 0, 0] };
+/** Scratch для вызовов sampleGround вне горячего цикла рендера */
+const GROUND_SCRATCH: GroundSample = { h: 0, light: 0, rgb: [0, 0, 0] };
 
 export class ColumnMap {
-  /** Плоские массивы окна: слот × 256 колонок. Рендер читает их напрямую. */
-  readonly colH = new Float32Array(WINDOW * WINDOW * SLOT_CELLS);
-  readonly colKind = new Uint8Array(WINDOW * WINDOW * SLOT_CELLS);
+  /** Плоские массивы мира: тайл × 256 колонок. Рендер читает их напрямую. */
+  readonly colH = new Float32Array(WORLD_TILES * WORLD_TILES * SLOT_CELLS);
   /** Запечённый свет 0..255 (0.35..1.0 × 255) */
-  readonly colLight = new Uint8Array(WINDOW * WINDOW * SLOT_CELLS);
-  /** Высота чистого рельефа (без стен) — для билинейного сглаживания земли */
-  readonly colGround = new Float32Array(WINDOW * WINDOW * SLOT_CELLS);
+  readonly colLight = new Uint8Array(WORLD_TILES * WORLD_TILES * SLOT_CELLS);
   /** Базовый цвет земли RGB (палитра + биом + снег), 3 байта на колонну */
-  readonly colColor = new Uint8Array(WINDOW * WINDOW * SLOT_CELLS * 3);
-  /** Какой тайл сейчас в слоте (-1 — слот пуст) */
-  private readonly slotTag = new Int32Array(WINDOW * WINDOW).fill(-1);
+  readonly colColor = new Uint8Array(WORLD_TILES * WORLD_TILES * SLOT_CELLS * 3);
+  /** Запечён ли тайл в слоте */
+  private readonly slotBaked = new Uint8Array(WORLD_TILES * WORLD_TILES);
 
   constructor(private readonly terrain: Terrain) {}
 
-  /** Слот тороидального окна для тайла */
+  /** Слот тайла; -1 — тайл за границей мира */
   private slot(tx: number, tz: number): number {
-    return ((tx % WINDOW) + WINDOW) % WINDOW + (((tz % WINDOW) + WINDOW) % WINDOW) * WINDOW;
+    if (tx < -WORLD_HALF || tx >= WORLD_HALF || tz < -WORLD_HALF || tz >= WORLD_HALF) return -1;
+    return tx + WORLD_HALF + (tz + WORLD_HALF) * WORLD_TILES;
   }
 
-  /** Индекс колонны по клетке сетки; -1, если её тайл ещё не запечён */
+  /** Индекс колонны по клетке сетки; -1 — вне мира или тайл ещё не запечён */
   private cellIndex(gx: number, gz: number): number {
-    const tx = gx >> 4;
-    const tz = gz >> 4;
-    const s = this.slot(tx, tz);
-    if (this.slotTag[s] !== chunkKey(tx, tz)) return -1;
+    const s = this.slot(gx >> 4, gz >> 4);
+    if (s < 0 || this.slotBaked[s] === 0) return -1;
     return s * SLOT_CELLS + ((gz & 15) << 4) + (gx & 15);
   }
 
   /**
-   * Индекс колонны в плоских массивах по мировой точке; -1, если её тайл ещё
-   * не запечён (рендер такую колонну пропускает — там туман).
+   * Индекс колонны в плоских массивах по мировой точке; -1 — вне мира
+   * (рендер такую колонну пропускает — там дымка тумана).
    */
   columnIndexAt(wx: number, wz: number): number {
     return this.cellIndex(Math.floor(wx / CELL), Math.floor(wz / CELL));
   }
 
-  /**
-   * Высота поверхности в точке: сооружения — по колонне (блоки, ярусы зиккурата
-   * обязаны быть ровными), земля и валуны — билинейно сглаженные (валуны
-   * скругляются в склоны; совпадает с terrain.getHeight вне стен).
-   * Незапечённое — напрямую из террейна (рейкасты, спрайты).
-   */
+  /** Высота поверхности в точке: запечённая билинейка, вне мира — аналитика */
   heightAt(wx: number, wz: number): number {
-    const i = this.columnIndexAt(wx, wz);
-    if (i < 0) return this.terrain.floorAt(wx, wz);
-    if (this.colKind[i] >= 2) return this.colH[i];
     return this.sampleGround(wx, wz, GROUND_SCRATCH) ? GROUND_SCRATCH.h : this.terrain.getHeight(wx, wz);
   }
 
   /**
    * Билинейный сэмпл поверхности: высота, свет и базовый цвет интерполируются
-   * между центрами 4 соседних колонн — земля рисуется плавной, без сетки 2×2,
-   * а валуны (kind 1) скругляются: их верх входит в поле высот, и грани
-   * превращаются в склоны. Сооружения (kind ≥ 2) в поле не участвуют — они
-   * рисуются блоками поверх. (colGround — getHeight в узлах той же сетки,
-   * поэтому вне стен интерполяция воспроизводит аналитический рельеф точно.)
-   * false — хоть одна из 4 колонн не запечена.
+   * между центрами 4 соседних колонн — земля рисуется плавной, без сетки 2×2.
+   * colH — getHeight в центрах клеток, а узлы аналитического рельефа стоят в
+   * углах, поэтому результат — слегка сглаженный рельеф (до ~0.2 юнита
+   * отличия от getHeight). Физика обязана опираться именно на эту поверхность
+   * (heightAt), иначе ступни расходятся с видимой землёй. false — хоть одна
+   * из 4 колонн вне мира.
    */
   sampleGround(wx: number, wz: number, out: GroundSample): boolean {
     const fx = wx / CELL - 0.5;
@@ -181,24 +162,14 @@ export class ColumnMap {
     if ((i00 | i10 | i01 | i11) < 0) return false;
     const u = fx - gx;
     const v = fz - gz;
-    const g = this.colGround;
+    const g = this.colH;
     const l = this.colLight;
     const c = this.colColor;
-    const k = this.colKind;
-    const hh = this.colH;
-    // Поле поверхности: валун — его верх (с джиттером), иначе — рельеф
-    const f00 = k[i00] === 1 ? hh[i00] : g[i00];
-    const f10 = k[i10] === 1 ? hh[i10] : g[i10];
-    const f01 = k[i01] === 1 ? hh[i01] : g[i01];
-    const f11 = k[i11] === 1 ? hh[i11] : g[i11];
-    const h0 = f00 + (f10 - f00) * u;
-    const h1 = f01 + (f11 - f01) * u;
-    const g0 = g[i00] + (g[i10] - g[i00]) * u;
-    const g1 = g[i01] + (g[i11] - g[i01]) * u;
+    const h0 = g[i00] + (g[i10] - g[i00]) * u;
+    const h1 = g[i01] + (g[i11] - g[i01]) * u;
     const l0 = l[i00] + (l[i10] - l[i00]) * u;
     const l1 = l[i01] + (l[i11] - l[i01]) * u;
     out.h = h0 + (h1 - h0) * v;
-    out.ground = g0 + (g1 - g0) * v;
     out.light = (l0 + (l1 - l0) * v) / 255;
     for (let ch = 0; ch < 3; ch++) {
       const o00 = i00 * 3 + ch;
@@ -212,102 +183,25 @@ export class ColumnMap {
     return true;
   }
 
-  /**
-   * Верх твёрдой поверхности в точке строго по отрисованным колоннам
-   * (kind ≥ 1: стена, сооружение, пандус), null — голый рельеф.
-   * Опора игрока идёт по этой функции, чтобы «что видно, то и твёрдое»:
-   * аналитические hex-стены террейна с отрисованными блоками 2×2 не совпадают.
-   */
-  wallTopAt(wx: number, wz: number): number | null {
-    const i = this.columnIndexAt(wx, wz);
-    if (i < 0) return this.terrain.wallTopAt(wx, wz); // вне окна — аналитика (запасной путь)
-    return this.colKind[i] >= 1 ? this.colH[i] : null;
-  }
-
-  /**
-   * Точная проверка: пересекает ли круг (x,z,r) хоть одну отрисованную колонну
-   * преграды (kind 1 — стена, 2 — сооружение; kind 3 — пандус — не блокирует)
-   * с верхом выше feetY + step. Клетки — квадраты CELL×CELL, проверка —
-   * ближайшая точка клетки к центру круга; касание (d == r) не считается.
-   */
-  circleHitsWall(x: number, z: number, r: number, feetY: number, step = 0.25): boolean {
-    const gx0 = Math.floor((x - r) / CELL);
-    const gx1 = Math.floor((x + r) / CELL);
-    const gz0 = Math.floor((z - r) / CELL);
-    const gz1 = Math.floor((z + r) / CELL);
-    for (let gz = gz0; gz <= gz1; gz++) {
-      for (let gx = gx0; gx <= gx1; gx++) {
-        const cx = Math.max(gx * CELL, Math.min(x, gx * CELL + CELL));
-        const cz = Math.max(gz * CELL, Math.min(z, gz * CELL + CELL));
-        const ddx = cx - x;
-        const ddz = cz - z;
-        if (ddx * ddx + ddz * ddz >= r * r) continue;
-        const wx = (gx + 0.5) * CELL;
-        const wz = (gz + 0.5) * CELL;
-        let top: number | null = null;
-        const i = this.columnIndexAt(wx, wz);
-        if (i < 0) {
-          top = this.terrain.blocksAt(wx, wz); // вне окна — аналитика (запасной путь)
-        } else if (this.colKind[i] === 1 || this.colKind[i] === 2) {
-          top = this.colH[i];
-        }
-        if (top !== null && top > feetY + step) return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Запечь недостающие тайлы вокруг точки: ближние первыми, не больше budget
-   * за вызов (запекание ~0.3 мс на тайл — размазываем по кадрам).
-   */
-  ensureAround(x: number, z: number, budget = 2): void {
-    const ctx = Math.floor(x / (TILE_CELLS * CELL));
-    const ctz = Math.floor(z / (TILE_CELLS * CELL));
-    for (let ring = 0; ring <= VIEW_RADIUS && budget > 0; ring++) {
-      for (let dz = -ring; dz <= ring && budget > 0; dz++) {
-        for (let dx = -ring; dx <= ring && budget > 0; dx++) {
-          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue; // только кольцо
-          const tx = ctx + dx;
-          const tz = ctz + dz;
-          const s = this.slot(tx, tz);
-          if (this.slotTag[s] === chunkKey(tx, tz)) continue;
-          this.bake(tx, tz, s);
-          budget--;
-        }
+  /** Запечь весь мир (64 тайла, один раз на старте) */
+  bakeWorld(): void {
+    for (let tz = -WORLD_HALF; tz < WORLD_HALF; tz++) {
+      for (let tx = -WORLD_HALF; tx < WORLD_HALF; tx++) {
+        this.bake(tx, tz, this.slot(tx, tz));
       }
     }
   }
 
-  /** Запечь всё окно сразу (старт игры — пока висит экран выбора оружия) */
-  bakeAllAround(x: number, z: number): void {
-    this.ensureAround(x, z, Infinity);
-  }
-
-  /** Запекание одного тайла: высоты и типы с фартуком, затем свет и тени внутренних 16×16 */
+  /** Запекание одного тайла: высоты с фартуком, затем свет и тени внутренних 16×16 */
   private bake(tx: number, tz: number, slot: number): void {
     const baseGX = tx * TILE_CELLS - APRON;
     const baseGZ = tz * TILE_CELLS - APRON;
     for (let j = 0; j < APRON_N; j++) {
       const wz = (baseGZ + j + 0.5) * CELL;
       for (let i = 0; i < APRON_N; i++) {
-        const wx = (baseGX + i + 0.5) * CELL;
-        const idx = j * APRON_N + i;
-        // wallTopAt включает мегаструктуры; тип колонны — по сооружению
-        const st = this.terrain.structureAt(wx, wz);
-        const wallTop = this.terrain.wallTopAt(wx, wz);
-        if (wallTop !== null) {
-          apronH[idx] = wallTop;
-          apronKind[idx] = st ? (st.ramp ? 3 : 2) : 1;
-        } else {
-          apronH[idx] = this.terrain.getHeight(wx, wz);
-          apronKind[idx] = 0;
-        }
+        apronH[j * APRON_N + i] = this.terrain.getHeight((baseGX + i + 0.5) * CELL, wz);
       }
     }
-
-    // Рядом с мегаструктурой тени длинные — марш далеко за пределы фартука
-    const longShadows = this.terrain.structureNearTile(tx, tz, SHADOW_REACH_UNITS);
 
     const out = slot * SLOT_CELLS;
     for (let j = 0; j < TILE_CELLS; j++) {
@@ -326,58 +220,22 @@ export class ColumnMap {
         const dot = Math.max(0, (-dhdx * SUN_X + SUN_Y + -dhdz * SUN_Z) * inv);
         let light = 0.35 + 0.65 * dot;
 
-        // Тень: марш к солнцу; колонна выше луча — мы в тени
-        if (!longShadows) {
-          // Обычный тайл: короткий марш по фартуку (стены ≤ 5.6 юнита)
-          for (let s = 1; s <= SHADOW_STEPS; s++) {
-            const si = Math.min(APRON_N - 1, Math.max(0, Math.round(ai + SHADOW_DIR_X * s)));
-            const sj = Math.min(APRON_N - 1, Math.max(0, Math.round(aj + SHADOW_DIR_Z * s)));
-            if (apronH[sj * APRON_N + si] > h + SUN_RISE * s + 0.25) {
-              light *= SHADOW_LIGHT;
-              break;
-            }
-          }
-        } else {
-          // Мегаструктуры: марш с растущим шагом до SHADOW_REACH_CELLS;
-          // в пределах фартука — быстрые сэмплы, дальше — прямые запросы к террейну
-          let s = 0;
-          let step = 1;
-          while (s < SHADOW_REACH_CELLS) {
-            s += step;
-            if (s === 8) step = 2;
-            else if (s === 24) step = 4;
-            else if (s === 56) step = 8;
-            let sh: number;
-            if (s <= APRON) {
-              const si = Math.min(APRON_N - 1, Math.max(0, Math.round(ai + SHADOW_DIR_X * s)));
-              const sj = Math.min(APRON_N - 1, Math.max(0, Math.round(aj + SHADOW_DIR_Z * s)));
-              sh = apronH[sj * APRON_N + si];
-            } else {
-              sh = this.terrain.floorAt(wx + SHADOW_DIR_X * s * CELL, wz + SHADOW_DIR_Z * s * CELL);
-            }
-            if (sh > h + SUN_RISE * s + 0.25) {
-              light *= SHADOW_LIGHT;
-              break;
-            }
+        // Тень: марш к солнцу по фартуку; колонна выше луча — мы в тени
+        for (let s = 1; s <= SHADOW_STEPS; s++) {
+          const si = Math.min(APRON_N - 1, Math.max(0, Math.round(ai + SHADOW_DIR_X * s)));
+          const sj = Math.min(APRON_N - 1, Math.max(0, Math.round(aj + SHADOW_DIR_Z * s)));
+          if (apronH[sj * APRON_N + si] > h + SUN_RISE * s + 0.25) {
+            light *= SHADOW_LIGHT;
+            break;
           }
         }
 
         const o = out + (j << 4) + i;
-        const kind = apronKind[a];
-        // Валунам — джиттер высоты верха (±0.2): скалы вместо ровных кубов.
-        // Меньше шага подъёма (0.25), поэтому ходьба по верхам не ломается.
-        // Сооружения не трогаем: ярусы зиккурата обязаны оставаться ровно 1.8.
-        this.colH[o] =
-          kind === 1 ? h + (((hash2i(baseGX + ai, baseGZ + aj, 0x7a11) >>> 0) / 4294967296) - 0.5) * 0.4 : h;
-        this.colKind[o] = kind;
+        this.colH[o] = h;
         this.colLight[o] = Math.min(255, (light * 255) | 0);
-        // Чистый рельеф и его цвет — всегда (под стенами тоже: билинейная
-        // интерполяция земли читает соседей, включая колонны со стенами)
-        const gh = kind === 0 ? h : this.terrain.getHeight(wx, wz);
-        this.colGround[o] = gh;
-        groundBaseColor(gh, this.terrain.biomeAt(wx, wz), this.colColor, o * 3);
+        groundBaseColor(h, this.terrain.biomeAt(wx, wz), this.colColor, o * 3);
       }
     }
-    this.slotTag[slot] = chunkKey(tx, tz);
+    this.slotBaked[slot] = 1;
   }
 }
