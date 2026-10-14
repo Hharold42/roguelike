@@ -25,7 +25,8 @@
  */
 
 import { BASE_SPEED, GRAVITY_DOWN, GRAVITY_UP, GROUND_ACCEL, AIR_ACCEL, JUMP_SPEED, Player, SPRINT_MULT, type MoveInput } from "../src/player";
-import { CROUCH_DROP } from "../src/shared/game";
+import { BEAM_DMG_MAX, BEAM_DMG_MIN, CROUCH_DROP, beamCost } from "../src/shared/game";
+import { BASE_STATS } from "../src/shared/balance";
 import { segmentVsBody } from "../src/shared/hitbox";
 
 // ---------- Что бот видит и что возвращает ----------
@@ -58,11 +59,24 @@ export interface BotCtx {
   /** Монотонное время сервера, с */
   now: number;
   selfId: number;
-  self: { hp: number; mana: number; lock: number; cooldown: number; manaCost: number; boltSpeed: number; moveMul: number };
+  self: {
+    hp: number;
+    mana: number;
+    lock: number;
+    cooldown: number;
+    manaCost: number;
+    boltSpeed: number;
+    moveMul: number;
+    /** Идёт заряд луча и сколько набрано (0..1; сервер уже учёл потолок по мане) */
+    charging: boolean;
+    charge: number;
+  };
   enemies: readonly BotBody[];
   bolts: readonly BotBolt[];
   gadget: { x: number; y: number; z: number } | null;
   groundAt: (x: number, z: number) => number;
+  /** Верх построек с запасом на радиус тела (−∞ — пусто): стены останавливают бота */
+  solidTopAt: (x: number, z: number) => number;
   /** Половина размера мира (невидимая стена) */
   bound: number;
 }
@@ -75,6 +89,8 @@ export interface BotOut {
   pitch: number;
   crouch: number;
   shoot: boolean;
+  /** Альтернативный выстрел: держать заряд / отпустить (выстрелить) / сорвать без выстрела */
+  beam: "none" | "hold" | "release" | "cancel";
 }
 
 // ---------- Вспомогательное ----------
@@ -367,6 +383,7 @@ export class BotBrain {
   respawn(x: number, y: number, z: number): void {
     this.player.teleport(x, y, z);
     this.dodge = "none";
+    this.beamOn = false;
     this.seen.clear();
     this.wp = null;
     this.target = 0;
@@ -405,7 +422,7 @@ export class BotBrain {
 
     // 2. Цель
     const eyeY = pl.eyeY();
-    if (now >= this.nextRetarget) {
+    if (now >= this.nextRetarget && !this.beamOn) { // во время заряда луча цель не меняем
       this.nextRetarget = now + 0.2;
       this.pickTarget(ctx, ex, eyeY, ez, now);
     }
@@ -419,15 +436,17 @@ export class BotBrain {
     if (tb && tr) {
       dist = Math.hypot(tb.x - ex, tb.z - ez);
       los = this.hasLOS(ctx, ex, eyeY, ez, tb.x, tb.y + 1.2 - CROUCH_DROP * tb.crouch, tb.z);
-      shoot = this.aim(dt, ctx, tb, tr, ex, eyeY, ez, dist, los, now);
+      if (this.beamOn) this.aimBeam(dt, tb, ex, eyeY, ez, dist, now);
+      else shoot = this.aim(dt, ctx, tb, tr, ex, eyeY, ez, dist, los, now);
     }
+    const beam = this.beamStep(ctx, tb, dist, los, now);
 
     // 4. Движение: уклонение важнее намерений
-    const input = this.movement(ctx, tb, tr, dist, los, now);
+    const input = this.unstick(this.movement(ctx, tb, tr, dist, los, now), now);
 
     // 5. Физика и вывод
-    pl.update(dt, input, this.yaw, ctx.groundAt, ctx.bound);
-    return { x: pl.x, y: pl.y, z: pl.z, yaw: this.yaw, pitch: this.pitch, crouch: pl.crouch, shoot };
+    pl.update(dt, input, this.yaw, ctx.groundAt, ctx.bound, ctx.solidTopAt);
+    return { x: pl.x, y: pl.y, z: pl.z, yaw: this.yaw, pitch: this.pitch, crouch: pl.crouch, shoot, beam };
   }
 
   // ---------- Цель ----------
@@ -457,7 +476,8 @@ export class BotBrain {
   /** Прямая видимость: рельеф между глазами и точкой (проба вдоль отрезка) */
   private hasLOS(ctx: BotCtx, ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
     const d = Math.hypot(bx - ax, bz - az);
-    const n = Math.min(16, Math.max(2, Math.ceil(d / 3)));
+    // Шаг ≤ ~1.6: стена толщиной 2 не проскакивается между пробами
+    const n = Math.min(90, Math.max(2, Math.ceil(d / 1.5)));
     for (let i = 1; i < n; i++) {
       const s = i / n;
       const x = ax + (bx - ax) * s;
@@ -496,23 +516,7 @@ export class BotBrain {
     const desYaw = Math.atan2(tx, tz);
     const desPitch = Math.atan2(ty, Math.hypot(tx, tz));
 
-    // Дрожь прицела: медленный шум, перерисовывается ~7 раз в секунду
-    if (now >= this.noiseT) {
-      this.noiseT = now + 0.14;
-      this.noiseYaw = gauss() * this.sigma;
-      this.noisePitch = gauss() * this.sigma;
-    }
-    // Наведение с ограничением угловой скорости: быстро вблизи цели, медленно при больших поворотах
-    const stepMax = this.wMax * dt;
-    const ey1 = wrap(desYaw + this.noiseYaw - this.yaw);
-    const ep1 = desPitch + this.noisePitch - this.pitch;
-    this.yaw += clamp(ey1 * Math.min(1, 14 * dt), -stepMax, stepMax);
-    this.pitch = clamp(this.pitch + clamp(ep1 * Math.min(1, 14 * dt), -stepMax, stepMax), -1.4, 1.4);
-
-    // Ошибка прицела относительно идеальной точки (без шума) и допуск по дальности
-    const errYaw = wrap(desYaw - this.yaw) * Math.cos(this.pitch);
-    const errPitch = desPitch - this.pitch;
-    const err = Math.hypot(errYaw, errPitch);
+    const err = this.steer(dt, desYaw, desPitch, now);
     const tol = clamp(Math.atan2(0.3, Math.max(dist, 4)), 0.012, 0.09);
 
     const s = ctx.self;
@@ -531,6 +535,111 @@ export class BotBrain {
     }
     tr.shots++;
     return true;
+  }
+
+  /**
+   * Довернуть прицел к нужным углам: дрожь, ограничение угловой скорости.
+   * Возвращает угловую ошибку до идеального направления (без шума), рад.
+   */
+  private steer(dt: number, desYaw: number, desPitch: number, now: number): number {
+    // Дрожь прицела: медленный шум, перерисовывается ~7 раз в секунду
+    if (now >= this.noiseT) {
+      this.noiseT = now + 0.14;
+      this.noiseYaw = gauss() * this.sigma;
+      this.noisePitch = gauss() * this.sigma;
+    }
+    // Быстро вблизи цели, медленно при больших поворотах
+    const stepMax = this.wMax * dt;
+    const ey1 = wrap(desYaw + this.noiseYaw - this.yaw);
+    const ep1 = desPitch + this.noisePitch - this.pitch;
+    this.yaw += clamp(ey1 * Math.min(1, 14 * dt), -stepMax, stepMax);
+    this.pitch = clamp(this.pitch + clamp(ep1 * Math.min(1, 14 * dt), -stepMax, stepMax), -1.4, 1.4);
+    const errYaw = wrap(desYaw - this.yaw) * Math.cos(this.pitch);
+    return Math.hypot(errYaw, desPitch - this.pitch);
+  }
+
+  // ---------- Альтернативный выстрел: заряженный луч ----------
+
+  private beamOn = false;
+  private beamStart = 0;
+  private beamNeed = 0;
+  private beamPierce = false;
+  private beamTarget = 0;
+  private beamErr = 1;
+  private beamTol = 0.05;
+  private nextBeam = 0;
+
+  /** Прицел под луч: хитскан мгновенный — упреждение не нужно, целимся в текущую точку цели */
+  private aimBeam(dt: number, tb: BotBody, ex: number, ey: number, ez: number, dist: number, now: number): void {
+    const tx = tb.x - ex;
+    const ty = tb.y + 1.05 - CROUCH_DROP * tb.crouch - ey;
+    const tz = tb.z - ez;
+    this.beamErr = this.steer(dt, Math.atan2(tx, tz), Math.atan2(ty, Math.hypot(tx, tz)), now);
+    // Допуск: тело (0.32) + радиус луча (толще при большом заряде)
+    this.beamTol = clamp(Math.atan2(0.3 + 0.1 * this.beamNeed, Math.max(dist, 4)) * 0.8, 0.01, 0.1);
+  }
+
+  /**
+   * Решение по лучу. Хитскан выгоден там, где заряды долго летят и цель успевает
+   * уйти (дальний бой при прямой видимости), и единственный способ достать
+   * цель за холмом — полный заряд, который прошивает рельеф. Урон луча зависит
+   * от заряда, поэтому бот держит ровно столько, сколько нужно, чтобы убить
+   * (хп цели + запас), и не тратит ману сверх.
+   */
+  private beamStep(ctx: BotCtx, tb: BotBody | null, dist: number, los: boolean, now: number): BotOut["beam"] {
+    const s = ctx.self;
+    if (this.beamOn) {
+      // Сервер мог не принять заряд или сорвать его (блокировка маны, смерть)
+      if (!s.charging && now - this.beamStart > 0.2) {
+        this.beamOn = false;
+        return "none";
+      }
+      if (!tb || tb.id !== this.beamTarget) {
+        this.beamOn = false;
+        this.nextBeam = now + 1;
+        return "cancel";
+      }
+      const elapsed = now - this.beamStart;
+      if (s.charge >= this.beamNeed - 0.02) {
+        // Заряд набран — ждём, пока прицел сядет на цель; прошивающему видимость не нужна
+        if (this.beamErr < this.beamTol && (los || this.beamPierce)) {
+          this.beamOn = false;
+          this.nextBeam = now + rnd(2, 4);
+          return "release";
+        }
+        if (elapsed > this.beamNeed * 3 + 1.3) {
+          this.beamOn = false;
+          this.nextBeam = now + 1.5;
+          return "cancel"; // так и не навёлся — не тратим ману
+        }
+      } else if (elapsed > 4.5) {
+        this.beamOn = false;
+        this.nextBeam = now + 2;
+        return "cancel"; // мана не позволяет набрать нужное
+      }
+      return "hold";
+    }
+
+    if (!tb || now < this.nextBeam || s.cooldown > 0 || s.lock > 0) return "none";
+    this.nextBeam = now + rnd(0.6, 1.4); // следующая попытка решения — не каждый тик
+    const k = s.manaCost / BASE_STATS.manaCost;
+    let c = 0;
+    let pierce = false;
+    if (los && dist >= 26 && dist <= 130) {
+      c = clamp((tb.hp + 5 - BEAM_DMG_MIN) / (BEAM_DMG_MAX - BEAM_DMG_MIN), 0.04, 1);
+      if (Math.random() > 0.65 || s.mana < beamCost(c) * k + 15) return "none";
+    } else if (!los && dist <= 70) {
+      c = 1;
+      pierce = true;
+      if (Math.random() > 0.5 || s.mana < beamCost(1) * k * 0.98) return "none";
+    } else return "none";
+    this.beamOn = true;
+    this.beamStart = now;
+    this.beamNeed = c;
+    this.beamPierce = pierce;
+    this.beamTarget = tb.id;
+    this.beamErr = 1;
+    return "hold";
   }
 
   // ---------- Движение ----------
@@ -623,6 +732,37 @@ export class BotBrain {
   }
 
   private hopNow = false;
+
+  // Застревание у стен: бот упёрся — обходит боком с прыжком, при повторе меняет путь
+  private stuckCheckAt = 0;
+  private stuckX = 0;
+  private stuckZ = 0;
+  private stuckCount = 0;
+  private unstickUntil = 0;
+  private unstickSide = 1;
+
+  private unstick(input: MoveInput, now: number): MoveInput {
+    const pl = this.player;
+    if (now < this.unstickUntil) {
+      return { fwd: input.fwd * 0.2, side: this.unstickSide, jump: false, jumpHeld: true, crouch: false, sprint: false };
+    }
+    if (now >= this.stuckCheckAt) {
+      const wants = Math.abs(input.fwd) + Math.abs(input.side) > 0.5;
+      const moved = Math.hypot(pl.x - this.stuckX, pl.z - this.stuckZ);
+      this.stuckCheckAt = now + 0.5;
+      this.stuckX = pl.x;
+      this.stuckZ = pl.z;
+      if (wants && moved < 0.8) {
+        this.stuckCount++;
+        this.unstickSide = Math.random() < 0.5 ? -1 : 1;
+        this.unstickUntil = now + rnd(0.5, 0.9);
+        if (this.stuckCount >= 2) this.wp = null; // не помогает — выбрать другую точку
+        return { fwd: 0, side: this.unstickSide, jump: true, jumpHeld: true, crouch: false, sprint: false };
+      }
+      if (moved > 2) this.stuckCount = 0;
+    }
+    return input;
+  }
 
   private maybeHop(now: number, running: boolean): void {
     if (now < this.hopAt || !this.player.onGround) return;

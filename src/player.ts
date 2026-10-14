@@ -1,8 +1,10 @@
 /**
  * Игрок от первого лица: точка со ступнями на рельефе, стандартная
  * FPS-физика — разгон/торможение, гравитация с «не лунной» дугой прыжка,
- * coyote time и буфер прыжка, присед, спринт. Стен в мире нет — единственная
- * опора и преграда это сам рельеф (аналитический getHeight, работает везде).
+ * coyote time и буфер прыжка, присед, спринт. Опора — рельеф и верх построек
+ * (groundAt); стены построек не пускают (solidTopAt), если их верх выше ступни
+ * больше чем на STEP_UP — низкие ступени проходятся пешком, низкие стенки
+ * перепрыгиваются.
  * Позиция ограничена границами мира (невидимая стена на краю).
  */
 
@@ -37,6 +39,10 @@ const APEX_VY = 1.6; // около вершины гравитация осла�
 const APEX_GRAVITY = 0.55;
 const COYOTE_TIME = 0.1; // с после схода с края ещё можно прыгнуть
 const JUMP_BUFFER = 0.12; // нажатие чуть раньше приземления не теряется
+/** Радиус тела при столкновении с постройками */
+export const COLLIDE_R = 0.35;
+/** Выше этого от ступни стена не пускает (ступени лестницы — 0.4) */
+export const STEP_UP = 0.55;
 const STEP_DOWN = 0.5; // опора ушла ниже на столько за кадр — падаем (сошли с уступа)
 
 const CROUCH_RATE = 10; // скорость перехода в присед и обратно (1/с)
@@ -100,9 +106,17 @@ export class Player {
 
   /**
    * Шаг физики. groundAt(x, z) — высота опоры; bound — половина размера мира
-   * (позиция клампится в ±bound).
+   * (позиция клампится в ±bound). solidTopAt(x, z) — верх построек, расширенных
+   * на радиус тела (−∞ если пусто): по осям отдельно, чтобы скользить вдоль стен.
    */
-  update(dt: number, input: MoveInput, yaw: number, groundAt: (x: number, z: number) => number, bound: number): void {
+  update(
+    dt: number,
+    input: MoveInput,
+    yaw: number,
+    groundAt: (x: number, z: number) => number,
+    bound: number,
+    solidTopAt?: (x: number, z: number) => number,
+  ): void {
     // Таймеры
     this.coyote = this.onGround ? COYOTE_TIME : Math.max(0, this.coyote - dt);
     this.jumpBuf = input.jump ? JUMP_BUFFER : Math.max(0, this.jumpBuf - dt);
@@ -136,8 +150,24 @@ export class Player {
       }
     }
 
-    this.x = clamp(this.x + this.vx * dt, -bound, bound);
-    this.z = clamp(this.z + this.vz * dt, -bound, bound);
+    let nx = clamp(this.x + this.vx * dt, -bound, bound);
+    let nz = clamp(this.z + this.vz * dt, -bound, bound);
+    if (solidTopAt) {
+      const reach = this.y + STEP_UP;
+      // Уже внутри расширенного контура (приземлились вплотную) — не запираем, даём выйти
+      if (solidTopAt(this.x, this.z) <= reach) {
+        if (solidTopAt(nx, this.z) > reach) {
+          nx = this.x;
+          this.vx = 0;
+        }
+        if (solidTopAt(nx, nz) > reach) {
+          nz = this.z;
+          this.vz = 0;
+        }
+      }
+    }
+    this.x = nx;
+    this.z = nz;
 
     // Прыжок: буфер + coyote
     if (this.jumpBuf > 0 && this.coyote > 0) {

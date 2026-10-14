@@ -21,7 +21,7 @@ import { ColumnMap, FOG_COL, SKY_TOP, SUN_X, SUN_Z } from "./columnMap";
 import type { GroundSample } from "./columnMap";
 import { GrassField } from "./grass";
 import { EntityLayer } from "./entities";
-import type { DrawBeam, DrawBolt, DrawGadget, DrawPlayer, DrawSpark } from "./entities";
+import type { DrawBeam, DrawBolt, DrawGadget, DrawGhost, DrawPlayer, DrawSpark, DrawWave } from "./entities";
 import { BAYER, FOG_LUT, LEVELS, Z_FAR } from "./gfx";
 
 // Старт марша почти у самых глаз: при взгляде отвесно вниз нижний луч бьёт в
@@ -63,6 +63,8 @@ export class SoftRenderer {
   W = 320;
   H = 240;
   private focal = 0;
+  /** Фокус при обычном FOV; зум умножает его (setZoom) */
+  private baseFocal = 0;
   private img!: ImageData;
   private pix!: Uint8ClampedArray;
   private zbuf!: Float32Array; // глубина ближайшего окклюдера по пикселю (Z_FAR — небо)
@@ -106,7 +108,13 @@ export class SoftRenderer {
     this.pix = this.img.data;
     this.zbuf = new Float32Array(this.W * this.H);
     this.sunAdd = new Float32Array(this.W);
-    this.focal = this.W / 2 / Math.tan(HFOV / 2);
+    this.baseFocal = this.W / 2 / Math.tan(HFOV / 2);
+    this.focal = this.baseFocal;
+  }
+
+  /** Приближение камеры: 1 — обычный FOV, 2 — вдвое уже (вызывать до begin каждый кадр) */
+  setZoom(zoom: number): void {
+    this.focal = this.baseFocal * zoom;
   }
 
   // ---------- Кадр ----------
@@ -138,8 +146,16 @@ export class SoftRenderer {
     this.grass.trample(x, z, r);
   }
 
-  /** Игроки, заряды и искры поверх мира (вызывать после begin, до end) */
-  drawEntities(players: Iterable<DrawPlayer>, bolts: Iterable<DrawBolt>, sparks: Iterable<DrawSpark>, gadgets: Iterable<DrawGadget>, beams: Iterable<DrawBeam>): void {
+  /** Постройки, игроки, заряды, искры и эхолокация поверх мира (вызывать после begin, до end) */
+  drawEntities(
+    players: Iterable<DrawPlayer>,
+    bolts: Iterable<DrawBolt>,
+    sparks: Iterable<DrawSpark>,
+    gadgets: Iterable<DrawGadget>,
+    beams: Iterable<DrawBeam>,
+    ghosts: readonly DrawGhost[],
+    waves: readonly DrawWave[],
+  ): void {
     this.entities.render(
       this.pix,
       this.zbuf,
@@ -150,8 +166,11 @@ export class SoftRenderer {
       gadgets,
       beams,
       this.time,
+      { boxes: this.map.structures.boxes, ghosts, waves, groundAt: this.groundAt },
     );
   }
+
+  private readonly groundAt = (x: number, z: number): number => this.map.heightAt(x, z);
 
   /** Палочка в руке поверх всего кадра (после drawEntities, до end) */
   drawWand(color: number, kick: number, t: number, move: number, charge = 0): void {

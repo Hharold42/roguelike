@@ -17,7 +17,7 @@ import "./style.css";
 import { Terrain } from "./terrain";
 import { ColumnMap, WORLD_SIZE } from "./soft/columnMap";
 import { SoftRenderer } from "./soft/renderer";
-import { Player, type MoveInput } from "./player";
+import { COLLIDE_R, Player, type MoveInput } from "./player";
 import { Session } from "./session";
 import { Hud } from "./hud";
 import { clamp } from "./mathUtil";
@@ -25,6 +25,9 @@ import type { PoseMsg } from "./shared/game";
 
 const MOUSE_SENS = 0.0023; // рад yaw на пиксель мыши
 const PITCH_SENS = 0.0023;
+const ZOOM_MAX = 1.1; // добавка к зуму при полном заряде луча (итого ×2.1)
+const ZOOM_RATE = 10; // 1/с: плавность въезда и возврата
+const CHARGE_SLOW = 0.3; // на сколько замедляется поворот камеры при полном заряде (сверх компенсации зума)
 const PITCH_MAX = 1.15; // рад (~66°) вверх/вниз — предел рендера
 const POSE_INTERVAL = 1 / 30; // с между отправками позы серверу
 const SHOOT_INTERVAL = 0.06; // с между повторами выстрела при зажатой кнопке (кулдаун — на сервере)
@@ -63,12 +66,15 @@ async function boot(): Promise<void> {
   // Опора — ровно та поверхность, что рисует рендер (запечённая билинейка)
   const groundAt = (x: number, z: number): number => columnMap.heightAt(x, z);
 
+  const solidTopAt = (x: number, z: number): number => columnMap.structures.solidTopAt(x, z, COLLIDE_R);
+
   const player = new Player(session.spawn.x, groundAt(session.spawn.x, session.spawn.z), session.spawn.z);
   let yaw = -2.0;
   let pitch = -0.05;
   let locked = false;
   let firing = false;
   let charging = false; // ПКМ удерживается: идёт заряд луча
+  let zoom = 1; // текущее приближение камеры (сглаженное)
 
   const cancelCharge = (): void => {
     if (!charging) return;
@@ -104,8 +110,10 @@ async function boot(): Promise<void> {
   });
   window.addEventListener("mousemove", (e) => {
     if (!locked) return;
-    yaw += e.movementX * MOUSE_SENS;
-    pitch -= e.movementY * PITCH_SENS;
+    // При зуме поворот замедляется пропорционально (то же смещение на экране), плюс небольшое «утяжеление» по заряду
+    const sens = (1 / zoom) * (1 - CHARGE_SLOW * Math.max(0, session.me.charge));
+    yaw += e.movementX * MOUSE_SENS * sens;
+    pitch -= e.movementY * PITCH_SENS * sens;
     pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pitch));
   });
   window.addEventListener("mousedown", (e) => {
@@ -167,7 +175,7 @@ async function boot(): Promise<void> {
       : { fwd: 0, side: 0, jump: false, jumpHeld: false, crouch: false, sprint: false };
     prevSpace = space;
     player.speedMul = session.me.moveMul;
-    player.update(dt, input, yaw, groundAt, WORLD_BOUND);
+    player.update(dt, input, yaw, groundAt, WORLD_BOUND, solidTopAt);
 
     // Сеть: поза ~30 раз в секунду; выстрел — по зажатой кнопке (мана и кулдаун решает сервер)
     poseT -= dt;
@@ -197,8 +205,12 @@ async function boot(): Promise<void> {
     renderer.time = time;
     renderer.trample(player.x, player.z, 1.2);
     for (const r of session.players.values()) if (r.alive) renderer.trample(r.x, r.z, 1.2);
+    // Зум по заряду луча (заряд — с сервера, он учитывает потолок маны)
+    const zoomTarget = alive ? 1 + ZOOM_MAX * Math.max(0, session.me.charge) : 1;
+    zoom += (zoomTarget - zoom) * Math.min(1, dt * ZOOM_RATE);
+    renderer.setZoom(zoom);
     renderer.begin(eye.x, eye.y, eye.z, yaw, pitch);
-    renderer.drawEntities(session.alivePlayers(), session.boltList, session.sparkList, session.gadgetList(), session.beamList);
+    renderer.drawEntities(session.alivePlayers(), session.boltList, session.sparkList, session.gadgetList(), session.beamList, session.ghostList(), session.waveList());
     if (alive) renderer.drawWand(session.color, session.kick, time, Math.min(1, speedH / 6) * (player.onGround ? 1 : 0.2), Math.max(0, session.me.charge));
     renderer.end();
     hud.update(session, yaw);

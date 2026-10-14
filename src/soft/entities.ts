@@ -8,10 +8,19 @@
  * глубине fd — ровно тому, что лежит в z-буфере мира, поэтому тест глубины
  * честный: холмы и трава закрывают игроков, игроки — траву. Цвет проходит тот
  * же туман, палитру 6 уровней и дизеринг Байера, что и земля.
+ *
+ * Постройки (платформы, стены, лестницы) — оси-выровненные коробки; рисуются
+ * тем же приёмом: на пиксель решается пересечение луча с коробкой (slab-тест),
+ * t снова равно глубине, так что они честно закрывают игроков и закрываются
+ * рельефом. Кладка (кирпич/плита) считается по точке попадания.
+ *
+ * «Эхолокация»: враги, до которых дошла волна, рисуются как призраки — их
+ * контур (обод по нормали) и слабая заливка поверх всего, без z-теста.
  */
 
 import { FOG_COL, SUN_X, SUN_Y, SUN_Z } from "./columnMap";
 import { BAYER, FOG_LUT, LEVELS, Z_FAR } from "./gfx";
+import type { Box } from "../structures";
 import { BODY_R, BOLT_R, CROUCH_DROP, HEAD_CY, HEAD_R, BODY_TOP, PLAYER_COLORS } from "../shared/game";
 
 export interface DrawPlayer {
@@ -44,6 +53,36 @@ export interface DrawBeam {
   color: number;
   /** Остаток жизни 0..1 */
   life: number;
+}
+
+/** Призрак врага от эхолокации: рисуется поверх всего контуром */
+export interface DrawGhost {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  crouch: number;
+  /** Яркость 0..1 (гаснет за долю секунды) */
+  alpha: number;
+}
+
+/** Расходящаяся волна эхолокации (кольцо по земле) */
+export interface DrawWave {
+  x: number;
+  y: number;
+  z: number;
+  /** Текущий радиус, юниты */
+  r: number;
+  /** Яркость 0..1 */
+  alpha: number;
+}
+
+/** Всё, что рисуется на эхолокации и постройках */
+export interface SceneExtras {
+  boxes: readonly Box[];
+  ghosts: readonly DrawGhost[];
+  waves: readonly DrawWave[];
+  groundAt: (x: number, z: number) => number;
 }
 
 export interface DrawBolt {
@@ -92,6 +131,20 @@ export interface CamFrame {
 const BIG_BEAM_VIS = 2.2; // во сколько раз «крупный» луч толще на экране
 const BOLT_VIS_R = 0.14; // видимый радиус ядра заряда, юниты
 const Z_MIN = 0.05;
+const ECHO_RGB: [number, number, number] = [0.35, 0.95, 1];
+/** Цвет кладки по материалу (MAT_WALL, MAT_PLATFORM, MAT_STAIRS) */
+const BOX_COLORS: [number, number, number][] = [
+  [0.54, 0.49, 0.45],
+  [0.64, 0.6, 0.52],
+  [0.7, 0.6, 0.4],
+];
+const BOX_NEAR = 0.1;
+
+function cellHash(a: number, b: number, c: number): number {
+  let h = Math.imul(a, 73856093) ^ Math.imul(b, 19349663) ^ Math.imul(c, 83492791);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
 
 export class EntityLayer {
   private pix!: Uint8ClampedArray;
@@ -117,6 +170,7 @@ export class EntityLayer {
     gadgets: Iterable<DrawGadget>,
     beams: Iterable<DrawBeam>,
     time: number,
+    extras: SceneExtras,
   ): void {
     this.pix = pix;
     this.zbuf = zbuf;
@@ -130,14 +184,198 @@ export class EntityLayer {
     this.uy = cam.cosP;
     this.uz = -cam.cosY * cam.sinP;
 
+    for (const b of extras.boxes) this.drawBox(b);
     for (const p of players) {
-      this.drawPlayer(p);
+      this.drawPlayer(p, 0);
       if (p.charge > 0) this.drawChargeOrb(p, time);
     }
     for (const g of gadgets) this.drawGadget(g, time);
     for (const b of bolts) this.drawBolt(b);
     for (const bm of beams) this.drawBeam(bm);
     for (const s of sparks) this.drawSpark(s);
+    for (const w of extras.waves) this.drawWave(w, extras.groundAt);
+    for (const g of extras.ghosts) {
+      this.drawPlayer({ x: g.x, y: g.y, z: g.z, yaw: g.yaw, crouch: g.crouch, color: 0, flash: 0, charge: 0 }, g.alpha);
+    }
+  }
+
+  // ---------- Постройки ----------
+
+  private bbMinX = 0;
+  private bbMaxX = 0;
+  private bbMinY = 0;
+  private bbMaxY = 0;
+
+  private bbAdd(x: number, y: number, z: number, fd: number): void {
+    const sx = this.screenX(x, y, z, fd);
+    const sy = this.screenY(x, y, z, fd);
+    if (sx < this.bbMinX) this.bbMinX = sx;
+    if (sx > this.bbMaxX) this.bbMaxX = sx;
+    if (sy < this.bbMinY) this.bbMinY = sy;
+    if (sy > this.bbMaxY) this.bbMaxY = sy;
+  }
+
+  private readonly cx8 = new Float64Array(8);
+  private readonly cy8 = new Float64Array(8);
+  private readonly cz8 = new Float64Array(8);
+  private readonly cd8 = new Float64Array(8);
+
+  private drawBox(b: Box): void {
+    const c = this.cam;
+    // Дальше дальности тумана — не видно
+    const ddx = Math.max(0, Math.abs(c.x - (b.x0 + b.x1) * 0.5) - (b.x1 - b.x0) * 0.5);
+    const ddz = Math.max(0, Math.abs(c.z - (b.z0 + b.z1) * 0.5) - (b.z1 - b.z0) * 0.5);
+    if (ddx * ddx + ddz * ddz > Z_FAR * Z_FAR) return;
+
+    // Экранный габарит: рёбра коробки, обрезанные плоскостью near
+    const X = this.cx8;
+    const Y = this.cy8;
+    const Z = this.cz8;
+    const D = this.cd8;
+    let front = 0;
+    for (let i = 0; i < 8; i++) {
+      X[i] = i & 1 ? b.x1 : b.x0;
+      Y[i] = i & 2 ? b.top : b.bot;
+      Z[i] = i & 4 ? b.z1 : b.z0;
+      D[i] = this.depth(X[i], Y[i], Z[i]);
+      if (D[i] >= BOX_NEAR) front++;
+    }
+    if (front === 0) return;
+    this.bbMinX = this.bbMinY = Infinity;
+    this.bbMaxX = this.bbMaxY = -Infinity;
+    for (let bit = 1; bit <= 4; bit <<= 1) {
+      for (let i = 0; i < 8; i++) {
+        if (i & bit) continue;
+        const j = i | bit;
+        const fi = D[i] >= BOX_NEAR;
+        const fj = D[j] >= BOX_NEAR;
+        if (fi && fj) {
+          this.bbAdd(X[i], Y[i], Z[i], D[i]);
+          this.bbAdd(X[j], Y[j], Z[j], D[j]);
+        } else if (fi || fj) {
+          const a = fi ? i : j;
+          const o = fi ? j : i;
+          const t = (BOX_NEAR - D[a]) / (D[o] - D[a]);
+          this.bbAdd(X[a], Y[a], Z[a], D[a]);
+          this.bbAdd(X[a] + (X[o] - X[a]) * t, Y[a] + (Y[o] - Y[a]) * t, Z[a] + (Z[o] - Z[a]) * t, BOX_NEAR);
+        }
+      }
+    }
+    const x0 = Math.max(0, Math.floor(this.bbMinX) - 1);
+    const x1 = Math.min(c.W - 1, Math.ceil(this.bbMaxX) + 1);
+    const y0 = Math.max(0, Math.floor(this.bbMinY) - 1);
+    const y1 = Math.min(c.H - 1, Math.ceil(this.bbMaxY) + 1);
+    if (x0 > x1 || y0 > y1) return;
+
+    const ox = c.x;
+    const oy = c.y;
+    const oz = c.z;
+    const ax0 = b.x0 - ox;
+    const ax1 = b.x1 - ox;
+    const ay0 = b.bot - oy;
+    const ay1 = b.top - oy;
+    const az0 = b.z0 - oz;
+    const az1 = b.z1 - oz;
+    const base = BOX_COLORS[b.mat] ?? BOX_COLORS[0];
+    const { W, focal } = c;
+    const halfW = W / 2;
+    const halfH = c.H / 2;
+    const zbuf = this.zbuf;
+
+    for (let py = y0; py <= y1; py++) {
+      const v = (halfH - py) / focal;
+      const rowBase = py * W;
+      for (let px = x0; px <= x1; px++) {
+        const pi = rowBase + px;
+        const u = (px - halfW) / focal;
+        const dx = this.fx + u * this.rx + v * this.ux;
+        const dy = this.fy + v * this.uy;
+        const dz = this.fz + u * this.rz + v * this.uz;
+
+        const ix = 1 / dx;
+        const iy = 1 / dy;
+        const iz = 1 / dz;
+        let t1 = ax0 * ix;
+        let t2 = ax1 * ix;
+        const tnx = t1 < t2 ? t1 : t2;
+        let tmax = t1 < t2 ? t2 : t1;
+        t1 = ay0 * iy;
+        t2 = ay1 * iy;
+        const tny = t1 < t2 ? t1 : t2;
+        const txy = t1 < t2 ? t2 : t1;
+        t1 = az0 * iz;
+        t2 = az1 * iz;
+        const tnz = t1 < t2 ? t1 : t2;
+        const txz = t1 < t2 ? t2 : t1;
+        let tmin = tnx > tny ? tnx : tny;
+        if (tnz > tmin) tmin = tnz;
+        if (txy < tmax) tmax = txy;
+        if (txz < tmax) tmax = txz;
+        if (!(tmin <= tmax) || tmin < Z_MIN || tmin >= zbuf[pi]) continue;
+
+        const hx = ox + tmin * dx;
+        const hy = oy + tmin * dy;
+        const hz = oz + tmin * dz;
+        let nx = 0;
+        let ny = 0;
+        let nz = 0;
+        let tex: number;
+        if (tmin === tny) {
+          // Верх (низ не виден): плиты 1×1 с швами
+          ny = dy < 0 ? 1 : -1;
+          const gx = Math.floor(hx);
+          const gz = Math.floor(hz);
+          const fx = hx - gx;
+          const fz = hz - gz;
+          tex = fx < 0.05 || fz < 0.05 ? 0.76 : 0.96 + 0.1 * cellHash(gx, gz, b.mat);
+        } else {
+          // Бока: кирпичная кладка рядами по 0.5, кирпич 1.2, ряды смещены
+          let a: number;
+          if (tmin === tnx) {
+            nx = dx > 0 ? -1 : 1;
+            a = hz;
+          } else {
+            nz = dz > 0 ? -1 : 1;
+            a = hx;
+          }
+          const depthDown = (b.top - hy) / 0.5;
+          const row = Math.floor(depthDown);
+          const fr = depthDown - row;
+          const au = (a + (row & 1) * 0.6) / 1.2;
+          const col = Math.floor(au);
+          const fc = au - col;
+          tex = fr < 0.1 || fc < 0.05 ? 0.64 : 0.92 + 0.14 * cellHash(row, col, b.mat + 7);
+        }
+
+        const lam = nx * SUN_X + ny * SUN_Y + nz * SUN_Z;
+        const k = (0.4 + 0.6 * (lam > 0 ? lam : 0)) * tex;
+        let r = base[0] * k;
+        let g = base[1] * k;
+        let bl = base[2] * k;
+        const fogI = (tmin / Z_FAR) * 511;
+        const f = FOG_LUT[fogI > 511 ? 511 : fogI | 0];
+        r += (FOG_COL[0] - r) * f;
+        g += (FOG_COL[1] - g) * f;
+        bl += (FOG_COL[2] - bl) * f;
+        zbuf[pi] = tmin;
+        this.put(pi, px, py, r, g, bl);
+      }
+    }
+  }
+
+  // ---------- Эхолокация ----------
+
+  /** Кольцо волны по земле: ряд мягких дисков, видно и из-за неровностей */
+  private drawWave(w: DrawWave, groundAt: (x: number, z: number) => number): void {
+    if (w.alpha <= 0.02 || w.r < 1) return;
+    const n = Math.min(110, Math.max(28, Math.floor(w.r * 1.4)));
+    const gain = 0.55 * w.alpha;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const x = w.x + Math.cos(a) * w.r;
+      const z = w.z + Math.sin(a) * w.r;
+      this.disc(x, groundAt(x, z) + 0.15, z, 0.45, ECHO_RGB, gain, 0.8);
+    }
   }
 
   // ---------- Проекция ----------
@@ -161,7 +399,8 @@ export class EntityLayer {
 
   // ---------- Игрок ----------
 
-  private drawPlayer(p: DrawPlayer): void {
+  /** ghost > 0 — режим призрака эхолокации: без z-теста, только контур и слабая заливка */
+  private drawPlayer(p: DrawPlayer, ghost: number): void {
     const c = this.cam;
     const drop = CROUCH_DROP * p.crouch;
     const hcy = p.y + HEAD_CY - drop; // центр головы
@@ -218,13 +457,13 @@ export class EntityLayer {
       for (let px = x0; px <= x1; px++) {
         const pi = rowBase + px;
         const zb = this.zbuf[pi];
-        if (zb < nearest - 0.02) continue; // всё ближе игрока уже закрыто миром
+        if (ghost === 0 && zb < nearest - 0.02) continue; // всё ближе игрока уже закрыто миром
         const u = (px - halfW) / focal;
         const dx = this.fx + u * this.rx + v * this.ux;
         const dy = this.fy + v * this.uy;
         const dz = this.fz + u * this.rz + v * this.uz;
 
-        let bestT = zb;
+        let bestT = ghost > 0 ? 1e9 : zb;
         let nx = 0;
         let ny = 0;
         let nz = 0;
@@ -280,6 +519,20 @@ export class EntityLayer {
           }
         }
         if (kind === 0) continue;
+
+        if (ghost > 0) {
+          // Обод: чем косее поверхность к лучу, тем ярче — получается контур фигуры
+          const facing = Math.abs(nx * dx + ny * dy + nz * dz) / Math.sqrt(dx * dx + dy * dy + dz * dz);
+          const rim = 1 - facing;
+          const edge = rim <= 0.45 ? 0 : rim >= 0.85 ? 1 : (rim - 0.45) / 0.4;
+          const w = ghost * (0.16 + 0.84 * edge);
+          const i = pi * 4;
+          const pr = this.pix[i] / 255;
+          const pg = this.pix[i + 1] / 255;
+          const pb = this.pix[i + 2] / 255;
+          this.put(pi, px, py, pr + (ECHO_RGB[0] - pr) * w, pg + (ECHO_RGB[1] - pg) * w, pb + (ECHO_RGB[2] - pb) * w);
+          continue;
+        }
 
         // Свет: закатное солнце + ровный ambient
         const lam = nx * SUN_X + ny * SUN_Y + nz * SUN_Z;

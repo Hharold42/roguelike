@@ -257,6 +257,15 @@ body {
   text-shadow: 0 1px 2px #000;
 }
 
+/* Затемнение краёв при заряде луча: «прицельный» тоннельный эффект, яркость задаёт HUD */
+#scope {
+  position: fixed;
+  inset: 0;
+  opacity: 0;
+  background: radial-gradient(ellipse at center, transparent 45%, rgba(0, 0, 0, 0.6) 100%);
+  pointer-events: none;
+}
+
 /* Заряд луча (ПКМ): полоска под прицелом, цвет от нити к раскалённому белому */
 #chargeBar {
   position: fixed;

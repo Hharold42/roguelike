@@ -23,6 +23,7 @@ import { Terrain } from "../src/terrain";
 import { ColumnMap, WORLD_SIZE } from "../src/soft/columnMap";
 import { segmentVsBody, type Hit } from "../src/shared/hitbox";
 import { BotBrain } from "./bot";
+import { COLLIDE_R } from "../src/player";
 import {
   AIM_DIST,
   BEAM_CHARGE_TIME,
@@ -376,11 +377,12 @@ export class GameServer {
       const out = p.bot.update(dt, {
         now: this.clock,
         selfId: p.id,
-        self: { hp: p.hp, mana: p.mana, lock: p.lock, cooldown: p.cooldown, manaCost: p.stats.manaCost, boltSpeed: p.stats.boltSpeed, moveMul: p.stats.moveMul },
+        self: { hp: p.hp, mana: p.mana, lock: p.lock, cooldown: p.cooldown, manaCost: p.stats.manaCost, boltSpeed: p.stats.boltSpeed, moveMul: p.stats.moveMul, charging: p.charging, charge: p.charging ? this.chargeOf(p) : -1 },
         enemies: bodies.filter((q) => q !== p && q.alive),
         bolts: this.bolts,
         gadget: this.gadget,
         groundAt: (x, z) => this.map.heightAt(x, z),
+        solidTopAt: (x, z) => this.map.structures.solidTopAt(x, z, COLLIDE_R),
         bound: WORLD_BOUND,
       });
       p.x = out.x;
@@ -389,6 +391,10 @@ export class GameServer {
       p.yaw = out.yaw;
       p.pitch = out.pitch;
       p.crouch = out.crouch;
+      // Альтернативный выстрел: тот же путь, что у человека (заряд считает сервер)
+      if (out.beam === "hold" && !p.charging) this.startCharge(p);
+      else if (out.beam === "release") this.releaseCharge(p);
+      else if (out.beam === "cancel") p.charging = false;
       if (out.shoot) this.tryShoot(p);
     }
   }
@@ -451,7 +457,11 @@ export class GameServer {
   private spawnGadget(): void {
     const alive = [...this.players.values()].filter((q) => q.alive);
     if (alive.length === 0) return; // некому — подождём
-    const spot = pickGadgetSpot(alive, WORLD_BOUND - 6);
+    // Не внутри стен и платформ: гаджет должен быть доступен с земли
+    let spot = pickGadgetSpot(alive, WORLD_BOUND - 6);
+    for (let i = 0; i < 12 && this.map.structures.solidTopAt(spot.x, spot.z, 1.2) > -Infinity; i++) {
+      spot = pickGadgetSpot(alive, WORLD_BOUND - 6);
+    }
     const def = pick(GADGET_DEFS);
     this.gadget = { id: this.nextGadgetId++, kind: def.id, x: spot.x, y: this.map.heightAt(spot.x, spot.z), z: spot.z, ttl: GADGET_LIFETIME };
     console.info(`[game] гаджет «${def.title}» в (${spot.x.toFixed(0)}, ${spot.z.toFixed(0)}), разброс дальностей ${spot.spread.toFixed(1)} ю, ближайший игрок ${spot.minD.toFixed(0)} ю`);
@@ -667,9 +677,9 @@ export class GameServer {
     // Дальность: у закрытого рельефом луча — до первой точки под землёй
     let len = BEAM_RANGE;
     if (!pierce) {
-      for (let s = 1; s <= BEAM_RANGE; s += 1) {
+      for (let s = 0.5; s <= BEAM_RANGE; s += 0.5) {
         if (eyeY + d[1] * s < this.map.heightAt(p.x + d[0] * s, p.z + d[2] * s)) {
-          len = s - 0.5;
+          len = s - 0.25;
           break;
         }
       }
@@ -802,9 +812,10 @@ export class GameServer {
     const R = WORLD_BOUND - SPAWN_MARGIN;
     let best = { x: 0, y: 0, z: 0 };
     let bestD = -1;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 24; i++) {
       const x = (Math.random() * 2 - 1) * R;
       const z = (Math.random() * 2 - 1) * R;
+      if (this.map.structures.solidTopAt(x, z, 1.5) > -Infinity) continue; // не внутри построек
       let nearest = Infinity;
       for (const p of this.players.values()) if (p.alive) nearest = Math.min(nearest, Math.hypot(p.x - x, p.z - z));
       if (nearest > bestD) {

@@ -11,6 +11,7 @@
  */
 
 import { CHUNK_CELLS, TILE, Terrain } from "../terrain";
+import { Structures } from "../structures";
 
 export const CELL = TILE; // 2 юнита на колонну
 export const TILE_CELLS = CHUNK_CELLS; // 16 колонок в тайле (тайл = чанк террейна, 32 юнита)
@@ -113,7 +114,12 @@ export class ColumnMap {
   /** Запечён ли тайл в слоте */
   private readonly slotBaked = new Uint8Array(WORLD_TILES * WORLD_TILES);
 
-  constructor(private readonly terrain: Terrain) {}
+  /** Платформы, стены и лестницы (рисуются отдельным слоем, но участвуют в heightAt) */
+  readonly structures: Structures;
+
+  constructor(private readonly terrain: Terrain) {
+    this.structures = new Structures(terrain.zones, terrain.seed);
+  }
 
   /** Слот тайла; -1 — тайл за границей мира */
   private slot(tx: number, tz: number): number {
@@ -138,6 +144,13 @@ export class ColumnMap {
 
   /** Высота поверхности в точке: запечённая билинейка, вне мира — аналитика */
   heightAt(wx: number, wz: number): number {
+    const g = this.sampleGround(wx, wz, GROUND_SCRATCH) ? GROUND_SCRATCH.h : this.terrain.getHeight(wx, wz);
+    const s = this.structures.topAt(wx, wz);
+    return s > g ? s : g;
+  }
+
+  /** Высота только рельефа (без построек) */
+  terrainHeightAt(wx: number, wz: number): number {
     return this.sampleGround(wx, wz, GROUND_SCRATCH) ? GROUND_SCRATCH.h : this.terrain.getHeight(wx, wz);
   }
 

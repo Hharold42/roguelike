@@ -1,3 +1,5 @@
+import { planZones, type Zone } from "./structures";
+
 /** Размер одной клетки в мировых единицах */
 export const TILE = 2;
 /** Размер чанка в клетках (16 * 2 = 32 юнита) */
@@ -57,6 +59,9 @@ function clamp01(t: number): number {
 
 // ---------- Параметры рельефа ----------
 
+/** Ширина плавного перехода от площадки под постройкой к рельефу, юниты */
+const FLAT_BLEND = 8;
+
 /** Мелкие холмы */
 const HILL_AMPLITUDE = 2.6;
 const HILL_FREQ = 0.045; // на мировой юнит
@@ -74,13 +79,16 @@ export class Terrain {
   /** Точка старта: начало координат, там всегда ровная площадка */
   readonly spawn = { x: 0, z: 0 };
   readonly seed: number;
+  /** Зоны построек: под ними рельеф выровнен до уровня земли в центре зоны */
+  readonly zones: Zone[];
 
   constructor(seed = Math.floor(Math.random() * 1e9)) {
     this.seed = seed;
+    this.zones = planZones(seed).map((z) => ({ ...z, level: this.rawHeight(z.x, z.z) }));
   }
 
-  /** Высота вершины сетки (ix, iz) — узлы сетки идут с шагом TILE */
-  vertexHeight(ix: number, iz: number): number {
+  /** Высота вершины без выравнивания под постройки */
+  private rawVertex(ix: number, iz: number): number {
     const wx = ix * TILE;
     const wz = iz * TILE;
     let h = (fbm(wx * HILL_FREQ, wz * HILL_FREQ, this.seed) - 0.5) * 2 * HILL_AMPLITUDE;
@@ -90,6 +98,35 @@ export class Terrain {
     const d = Math.hypot(wx - this.spawn.x, wz - this.spawn.z);
     h *= smooth(clamp01((d - 5) / 12));
     return h;
+  }
+
+  /** Высота вершины сетки (ix, iz) — узлы сетки идут с шагом TILE */
+  vertexHeight(ix: number, iz: number): number {
+    let h = this.rawVertex(ix, iz);
+    // Под постройками — ровная площадка, дальше плавно к природному рельефу
+    const wx = ix * TILE;
+    const wz = iz * TILE;
+    for (const z of this.zones) {
+      const cheb = Math.max(Math.abs(wx - z.x), Math.abs(wz - z.z));
+      const inner = z.half + 2;
+      if (cheb >= inner + FLAT_BLEND) continue;
+      const w = 1 - smooth(clamp01((cheb - inner) / FLAT_BLEND));
+      h += (z.level - h) * w;
+    }
+    return h;
+  }
+
+  /** Природная высота в точке (билинейно по сырым вершинам) — по ней берётся уровень площадок */
+  private rawHeight(wx: number, wz: number): number {
+    const gx = wx / TILE;
+    const gz = wz / TILE;
+    const x0 = Math.floor(gx);
+    const z0 = Math.floor(gz);
+    const fx = gx - x0;
+    const fz = gz - z0;
+    const top = this.rawVertex(x0, z0) + (this.rawVertex(x0 + 1, z0) - this.rawVertex(x0, z0)) * fx;
+    const bottom = this.rawVertex(x0, z0 + 1) + (this.rawVertex(x0 + 1, z0 + 1) - this.rawVertex(x0, z0 + 1)) * fx;
+    return top + (bottom - top) * fz;
   }
 
   /** Высота рельефа в мировой точке (билинейная интерполяция между узлами) */

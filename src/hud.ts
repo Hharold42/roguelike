@@ -29,6 +29,7 @@ export class Hud {
   private readonly feed = $("feed");
   private readonly board = $("scoreboard");
   private readonly who = $("who");
+  private readonly scope = $("scope");
   private readonly chargeBar = $("chargeBar");
   private readonly chargeFill = $("chargeFill");
   private readonly chargeText = $("chargeText");
@@ -137,11 +138,12 @@ export class Hud {
   private updateCharge(c: number, alive: boolean): void {
     const on = alive && c >= 0;
     this.chargeBar.classList.toggle("on", on);
+    this.scope.style.opacity = on ? String(Math.min(1, c * 1.2)) : "0";
     if (!on) return;
     this.chargeFill.style.width = `${c * 100}%`;
     const full = c >= BEAM_PIERCE_AT;
     this.chargeBar.classList.toggle("full", full);
-    this.chargeText.textContent = full ? `${Math.round(beamDamage(c))} · прошивает землю` : `${Math.round(beamDamage(c))} урона`;
+    this.chargeText.textContent = full ? `${Math.round(beamDamage(c))} · прошивает землю · эхолокация` : `${Math.round(beamDamage(c))} урона`;
   }
 
   /** Чипы: стопки лёгких улучшений, перк за смерть, гаджет с таймером */

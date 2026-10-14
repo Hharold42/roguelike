@@ -10,11 +10,15 @@
 
 import type { GadgetMsg, HitPart, MeSnap, PlayerSnap, PoseMsg, ServerMsg } from "./shared/game";
 import { RADAR_COUNT, RADAR_INTERVAL, RADAR_SHOW, gadgetById, perkById, slightById } from "./shared/balance";
-import type { DrawBeam, DrawBolt, DrawGadget, DrawPlayer, DrawSpark } from "./soft/entities";
+import type { DrawBeam, DrawBolt, DrawGadget, DrawGhost, DrawPlayer, DrawSpark, DrawWave } from "./soft/entities";
 
 const CONNECT_TIMEOUT_MS = 5000;
 const SMOOTH_RATE = 20; // 1/с: догон удалённого игрока к последнему снимку
 const SPARK_GRAVITY = 9;
+/** Эхолокация при полном заряде луча: скорость и дальность волны, время жизни контура врага */
+const ECHO_SPEED = 90; // ю/с
+const ECHO_RADIUS = 90; // ю
+const GHOST_TTL = 0.7; // с — «очень короткое время»
 const WHITE = 6; // индекс «белого» в палитре — цвет по умолчанию
 
 /** Цвет шара-гаджета на карте и стрелки к нему */
@@ -106,6 +110,11 @@ export class Session {
   onClose: (() => void) | null = null;
 
   private radarT = 0;
+  /** Волна эхолокации: центр, радиус и уже «услышанные» враги */
+  private echo: { x: number; y: number; z: number; r: number; hit: Set<number> } | null = null;
+  private echoArmed = true;
+  /** Сколько ещё секунд виден контур врага (по id) */
+  private ghostTtl = new Map<number, number>();
   private ws!: WebSocket;
   private bolts: BoltView[] = [];
   private beams: BeamView[] = [];
@@ -365,10 +374,60 @@ export class Session {
     }
     this.beams = this.beams.filter((bm) => bm.ttl > 0);
     this.updateRadar(dt);
+    this.updateEcho(dt);
     if (this.gadget) this.gadget.ttl -= dt;
     if (this.hitMarker > 0) this.hitMarker -= dt;
     if (this.damageFlash > 0) this.damageFlash = Math.max(0, this.damageFlash - dt * 1.8);
     if (this.kick > 0) this.kick = Math.max(0, this.kick - dt * 6);
+  }
+
+  /**
+   * Эхолокация: при выходе заряда луча на максимум от меня расходится волна;
+   * каждый живой враг, до которого она дошла, на GHOST_TTL с получает контур,
+   * видимый сквозь рельеф и постройки. Чисто визуальный эффект: позиции врагов
+   * клиент и так знает из снимков.
+   */
+  private updateEcho(dt: number): void {
+    const full = this.me.alive && this.me.charge >= 0.999;
+    if (full && this.echoArmed) {
+      this.echoArmed = false;
+      this.echo = { x: this.myX, y: this.myY + 1, z: this.myZ, r: 0, hit: new Set() };
+    }
+    if (!full) this.echoArmed = true;
+    if (!this.me.alive) this.echo = null;
+
+    const e = this.echo;
+    if (e) {
+      e.r += ECHO_SPEED * dt;
+      for (const r of this.players.values()) {
+        if (!r.alive || e.hit.has(r.id)) continue;
+        if (Math.hypot(r.x - e.x, r.y + 1 - e.y, r.z - e.z) <= e.r) {
+          e.hit.add(r.id);
+          this.ghostTtl.set(r.id, GHOST_TTL);
+        }
+      }
+      if (e.r > ECHO_RADIUS) this.echo = null;
+    }
+    for (const [id, t] of this.ghostTtl) {
+      if (t - dt <= 0 || !this.players.get(id)?.alive) this.ghostTtl.delete(id);
+      else this.ghostTtl.set(id, t - dt);
+    }
+  }
+
+  /** Контуры врагов от эхолокации для рендера */
+  ghostList(): DrawGhost[] {
+    const out: DrawGhost[] = [];
+    for (const [id, t] of this.ghostTtl) {
+      const r = this.players.get(id);
+      if (r) out.push({ x: r.x, y: r.y, z: r.z, yaw: r.yaw, crouch: r.crouch, alpha: Math.min(1, (t / GHOST_TTL) * 1.6) });
+    }
+    return out;
+  }
+
+  /** Волна эхолокации для рендера (кольцо по земле) */
+  waveList(): DrawWave[] {
+    const e = this.echo;
+    return e ? [{ x: e.x, y: e.y, z: e.z, r: e.r, alpha: 1 - e.r / ECHO_RADIUS }] : [];
   }
 
   /** Радар: раз в RADAR_INTERVAL с «снимок» позиций ближайших врагов; стрелки гаснут за RADAR_SHOW с */
