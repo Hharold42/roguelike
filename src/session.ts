@@ -9,6 +9,7 @@
  */
 
 import type { GadgetMsg, HitPart, MeSnap, PlayerSnap, PoseMsg, ServerMsg } from "./shared/game";
+import { headCenterY } from "./shared/game";
 import { RADAR_COUNT, RADAR_INTERVAL, RADAR_SHOW, gadgetById, perkById, slightById } from "./shared/balance";
 import type { DrawBeam, DrawBolt, DrawGadget, DrawGhost, DrawPlayer, DrawSpark, DrawWave } from "./soft/entities";
 
@@ -45,6 +46,8 @@ export interface Remote extends DrawPlayer {
   tcrouch: number;
   hp: number;
   alive: boolean;
+  /** Секунд до конца «остановки времени» (контур горит, пока > 0) */
+  frozen?: number;
 }
 
 interface BoltView extends DrawBolt {
@@ -66,6 +69,23 @@ interface SparkView extends DrawSpark {
   maxTtl: number;
 }
 
+/** Всплывающая цифра урона у врага: точка в мире, куда я попал, и остаток жизни */
+export interface DamageNumber {
+  x: number;
+  y: number;
+  z: number;
+  /** 0 — щит поглотил попадание */
+  dmg: number;
+  head: boolean;
+  /** Разброс по экрану, px, чтобы подряд идущие цифры не слипались */
+  jx: number;
+  age: number;
+  ttl: number;
+}
+
+const DMG_NUM_TTL = 0.9;
+const DMG_NUM_MAX = 24;
+
 export interface KillEvent {
   killer: number; // цвет убийцы (индекс палитры)
   victim: number; // цвет жертвы
@@ -83,7 +103,7 @@ export class Session {
 
   /** Все игроки по последнему снимку (включая меня) — для таблицы счёта */
   scoreboard: PlayerSnap[] = [];
-  me: MeSnap = { hp: 100, mana: 100, manaMax: 100, lock: 0, lockTotal: 0, alive: true, respawn: 0, moveMul: 1, slight: {}, perks: [], gadget: null, shield: false, charge: -1 };
+  me: MeSnap = { hp: 100, mana: 100, manaMax: 100, lock: 0, lockTotal: 0, alive: true, respawn: 0, moveMul: 1, slight: {}, perks: [], gadget: null, shield: false, gold: 0, shop: [], charge: -1 };
   /** Остальные игроки */
   readonly players = new Map<number, Remote>();
 
@@ -95,9 +115,17 @@ export class Session {
   hitMarkerHead = false;
   damageFlash = 0;
   kick = 0;
+  /** Секунд, сколько я ещё застыл (остановка времени): main не двигает и не вертит камеру */
+  frozen = 0;
+  /** Длительность текущей заморозки — для плавного спада эффекта на экране */
+  frozenTotal = 1;
 
   /** Гаджет, лежащий на карте (null — нет) */
   gadget: GadgetMsg | null = null;
+  /** Цифры урона от моих попаданий (рисует HUD) */
+  damageNumbers: DamageNumber[] = [];
+  /** Монеты на земле */
+  readonly coins = new Map<number, { id: number; x: number; y: number; z: number; amount: number }>();
   /** Активные пинги радара */
   pings: Ping[] = [];
 
@@ -190,6 +218,11 @@ export class Session {
     if (this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: "release", ...p }));
   }
 
+  /** Купить улучшение в магазине (сервер проверяет цену и отвечает подсказкой) */
+  sendBuy(id: string): void {
+    if (this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: "buy", id }));
+  }
+
   /** Заряд сорван без выстрела */
   sendCancel(): void {
     if (this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: "cancel" }));
@@ -213,7 +246,7 @@ export class Session {
       }
       case "beam": {
         const ttl = 0.22 + 0.3 * msg.c; // сильный луч держится дольше
-        this.beams.push({ ax: msg.x, ay: msg.y, az: msg.z, bx: msg.ex, by: msg.ey, bz: msg.ez, c: msg.c, pierce: msg.pierce, big: msg.big, color: this.colorOf(msg.owner), life: 1, ttl, maxTtl: ttl });
+        this.beams.push({ ax: msg.x, ay: msg.y, az: msg.z, bx: msg.ex, by: msg.ey, bz: msg.ez, c: msg.c, pierce: msg.pierce, big: msg.big, cone: msg.cone === true, color: this.colorOf(msg.owner), life: 1, ttl, maxTtl: ttl });
         this.burst(msg.ex, msg.ey, msg.ez, this.colorOf(msg.owner), Math.round(6 + 34 * msg.c), 2.5 + 4 * msg.c);
         if (msg.owner === this.id) this.kick = 1;
         break;
@@ -229,6 +262,20 @@ export class Session {
         if (msg.attacker === this.id) {
           this.hitMarker = 0.28;
           this.hitMarkerHead = msg.part === "head";
+          const target = this.players.get(msg.victim);
+          if (target) {
+            this.damageNumbers.push({
+              x: target.x,
+              y: headCenterY(target.y, target.crouch) + 0.5,
+              z: target.z,
+              dmg: msg.absorbed ? 0 : msg.dmg,
+              head: msg.part === "head",
+              jx: (Math.random() - 0.5) * 36,
+              age: 0,
+              ttl: DMG_NUM_TTL,
+            });
+            if (this.damageNumbers.length > DMG_NUM_MAX) this.damageNumbers.shift();
+          }
         }
         if (msg.victim === this.id) {
           if (msg.absorbed) this.onToast?.("◆ Щит поглотил попадание");
@@ -264,6 +311,16 @@ export class Session {
       case "note":
         this.onToast?.(msg.text);
         break;
+      case "freeze": {
+        if (msg.id === this.id) {
+          this.frozen = msg.dur;
+          this.frozenTotal = msg.dur;
+        } else {
+          const r = this.players.get(msg.id);
+          if (r) r.frozen = msg.dur;
+        }
+        break;
+      }
       case "gadget":
         this.gadget = { id: msg.id, kind: msg.kind, x: msg.x, y: msg.y, z: msg.z, ttl: msg.ttl };
         break;
@@ -272,6 +329,13 @@ export class Session {
         break;
       case "upgrade":
         this.onToast?.(this.upgradeText(msg.tier, msg.id, msg.stacks));
+        break;
+      case "coin":
+        this.coins.set(msg.id, { id: msg.id, x: msg.x, y: msg.y, z: msg.z, amount: msg.amount });
+        break;
+      case "coinGone":
+        this.coins.delete(msg.id);
+        if (msg.by === this.id) this.onToast?.(`◆ +${msg.amount} монет`);
         break;
       case "proc": {
         const title = perkById(msg.id)?.title;
@@ -350,7 +414,12 @@ export class Session {
       d -= Math.round(d / (Math.PI * 2)) * Math.PI * 2;
       r.yaw += d * k;
       if (r.flash > 0) r.flash = Math.max(0, r.flash - dt * 5);
+      if (r.frozen && r.frozen > 0) {
+        r.frozen = Math.max(0, r.frozen - dt);
+        r.flash = Math.max(r.flash, 0.55); // застывший светится бледным
+      }
     }
+    if (this.frozen > 0) this.frozen = Math.max(0, this.frozen - dt);
     for (const b of this.bolts) {
       b.x += b.vx * dt;
       b.y += b.vy * dt;
@@ -377,6 +446,8 @@ export class Session {
     this.updateEcho(dt);
     if (this.gadget) this.gadget.ttl -= dt;
     if (this.hitMarker > 0) this.hitMarker -= dt;
+    for (const n of this.damageNumbers) n.age += dt;
+    this.damageNumbers = this.damageNumbers.filter((n) => n.age < n.ttl);
     if (this.damageFlash > 0) this.damageFlash = Math.max(0, this.damageFlash - dt * 1.8);
     if (this.kick > 0) this.kick = Math.max(0, this.kick - dt * 6);
   }
@@ -457,6 +528,27 @@ export class Session {
   gadgetList(): DrawGadget[] {
     const g = this.gadget;
     return g ? [{ x: g.x, y: g.y, z: g.z, rgb: GADGET_RGB[g.kind] ?? [1, 1, 1] }] : [];
+  }
+
+  /** Монеты для рендера: золотые шары со столбом света */
+  coinList(): DrawGadget[] {
+    const out: DrawGadget[] = [];
+    for (const c of this.coins.values()) out.push({ x: c.x, y: c.y, z: c.z, rgb: [1, 0.82, 0.18], coin: true });
+    return out;
+  }
+
+  /** Ближайшая монета (для стрелки HUD) */
+  nearestCoin(): { x: number; z: number } | null {
+    let best: { x: number; z: number } | null = null;
+    let bd = Infinity;
+    for (const c of this.coins.values()) {
+      const d = Math.hypot(c.x - this.myX, c.z - this.myZ);
+      if (d < bd) {
+        bd = d;
+        best = c;
+      }
+    }
+    return best;
   }
 
   /** Живые удалённые игроки для рендера */

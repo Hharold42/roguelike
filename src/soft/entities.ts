@@ -21,6 +21,7 @@
 import { FOG_COL, SUN_X, SUN_Y, SUN_Z } from "./columnMap";
 import { BAYER, FOG_LUT, LEVELS, Z_FAR } from "./gfx";
 import type { Box } from "../structures";
+import { coneTan } from "../shared/game";
 import { BODY_R, BOLT_R, CROUCH_DROP, HEAD_CY, HEAD_R, BODY_TOP, PLAYER_COLORS } from "../shared/game";
 
 export interface DrawPlayer {
@@ -53,6 +54,8 @@ export interface DrawBeam {
   color: number;
   /** Остаток жизни 0..1 */
   life: number;
+  /** Конусный луч: рисуется расширяющимся к цели */
+  cone: boolean;
 }
 
 /** Призрак врага от эхолокации: рисуется поверх всего контуром */
@@ -103,6 +106,8 @@ export interface DrawGadget {
   y: number;
   z: number;
   rgb: [number, number, number];
+  /** Монеты: низкий столб и шар поменьше */
+  coin?: boolean;
 }
 
 export interface DrawSpark {
@@ -128,6 +133,7 @@ export interface CamFrame {
   cosP: number;
 }
 
+const CONE_VIS_MAX = 110; // дальше этого конус на экране не рисуется (дальше он и так гаснет)
 const BIG_BEAM_VIS = 2.2; // во сколько раз «крупный» луч толще на экране
 const BOLT_VIS_R = 0.14; // видимый радиус ядра заряда, юниты
 const Z_MIN = 0.05;
@@ -137,8 +143,14 @@ const BOX_COLORS: [number, number, number][] = [
   [0.54, 0.49, 0.45],
   [0.64, 0.6, 0.52],
   [0.7, 0.6, 0.4],
+  [0.46, 0.58, 0.68], // летающие платформы — холоднее и светлее камня
 ];
 const BOX_NEAR = 0.1;
+/** Игроки теряются в тумане и в мелкости: туман на них слабее, а на экране они не тоньше этого радиуса (px) */
+const PLAYER_FOG = 0.35;
+const MIN_PLAYER_PX = 1.5;
+/** Маячок над врагом: с какой дальности и насколько крупный (px) */
+const MARKER_FROM = 16;
 
 function cellHash(a: number, b: number, c: number): number {
   let h = Math.imul(a, 73856093) ^ Math.imul(b, 19349663) ^ Math.imul(c, 83492791);
@@ -188,15 +200,34 @@ export class EntityLayer {
     for (const p of players) {
       this.drawPlayer(p, 0);
       if (p.charge > 0) this.drawChargeOrb(p, time);
+      this.drawMarker(p, time);
     }
     for (const g of gadgets) this.drawGadget(g, time);
     for (const b of bolts) this.drawBolt(b);
-    for (const bm of beams) this.drawBeam(bm);
+    for (const bm of beams) {
+      if (bm.cone) this.drawCone(bm); // объём конуса, поверх него — тонкое ядро луча
+      this.drawBeam(bm);
+    }
     for (const s of sparks) this.drawSpark(s);
     for (const w of extras.waves) this.drawWave(w, extras.groundAt);
     for (const g of extras.ghosts) {
       this.drawPlayer({ x: g.x, y: g.y, z: g.z, yaw: g.yaw, crouch: g.crouch, color: 0, flash: 0, charge: 0 }, g.alpha);
     }
+  }
+
+  /**
+   * Маячок над головой врага вдали: мигающая цветная точка постоянного размера на экране.
+   * Закрывается землёй и стенами по z-буферу, так что через препятствия не светит.
+   */
+  private drawMarker(p: DrawPlayer, time: number): void {
+    const c = this.cam;
+    const y = p.y + BODY_TOP + 0.6 - CROUCH_DROP * p.crouch;
+    const fd = this.depth(p.x, y, p.z);
+    if (fd < MARKER_FROM) return;
+    const rgb = PLAYER_COLORS[p.color % PLAYER_COLORS.length].rgb;
+    const fade = Math.min(1, (fd - MARKER_FROM) / 14); // появляется плавно
+    const gain = (0.6 + 0.3 * Math.sin(time * 6)) * fade;
+    this.disc(p.x, y, p.z, (1.6 * fd) / c.focal, rgb, gain, 0.4);
   }
 
   // ---------- Постройки ----------
@@ -412,14 +443,18 @@ export class EntityLayer {
     const fdB = this.depth(p.x, p.y, p.z);
     const fdT = this.depth(p.x, top, p.z);
     if (fdH < -1 && fdB < -1 && fdT < -1) return; // целиком за спиной
+    // Вдали фигура не тоньше MIN_PLAYER_PX пикселей в радиусе: иначе враг превращается в невидимую нитку
+    const grow = Math.max(1, (MIN_PLAYER_PX * Math.max(fdH, fdB, 1)) / (c.focal * BODY_R));
+    const hr = HEAD_R * grow;
+    const br = BODY_R * grow;
     let x0 = 0;
     let y0 = 0;
     let x1 = c.W - 1;
     let y1 = c.H - 1;
-    const fdMin = Math.min(fdH - HEAD_R, fdB - BODY_R, fdT - BODY_R);
+    const fdMin = Math.min(fdH - hr, fdB - br, fdT - br);
     if (fdMin > 0.3) {
       // Всё перед камерой: bbox по точкам оси и радиусу
-      const pad = (2.0 * c.focal * BODY_R) / fdMin + 2;
+      const pad = (2.0 * c.focal * br) / fdMin + 2;
       const sxH = this.screenX(p.x, hcy, p.z, fdH);
       const syH = this.screenY(p.x, hcy, p.z, fdH);
       const sxB = this.screenX(p.x, p.y, p.z, fdB);
@@ -439,12 +474,12 @@ export class EntityLayer {
     const mx = ox - p.x;
     const my = oy - hcy;
     const mz = oz - p.z;
-    const sphC = mx * mx + my * my + mz * mz - HEAD_R * HEAD_R;
+    const sphC = mx * mx + my * my + mz * mz - hr * hr;
     // цилиндр
     const ex = ox - p.x;
     const ez = oz - p.z;
-    const cylC = ex * ex + ez * ez - BODY_R * BODY_R;
-    const nearest = Math.min(fdH - HEAD_R, fdB - BODY_R);
+    const cylC = ex * ex + ez * ez - br * br;
+    const nearest = Math.min(fdH - hr, fdB - br);
     const faceX = Math.sin(p.yaw);
     const faceZ = Math.cos(p.yaw);
     const { W, focal } = c;
@@ -478,9 +513,9 @@ export class EntityLayer {
             const t = (-b - Math.sqrt(disc)) / a;
             if (t > Z_MIN && t < bestT) {
               bestT = t;
-              nx = (mx + t * dx) / HEAD_R;
-              ny = (my + t * dy) / HEAD_R;
-              nz = (mz + t * dz) / HEAD_R;
+              nx = (mx + t * dx) / hr;
+              ny = (my + t * dy) / hr;
+              nz = (mz + t * dz) / hr;
               kind = 1;
             }
           }
@@ -496,9 +531,9 @@ export class EntityLayer {
               const y = oy + t * dy;
               if (t > Z_MIN && t < bestT && y >= p.y && y <= top) {
                 bestT = t;
-                nx = (ex + t * dx) / BODY_R;
+                nx = (ex + t * dx) / br;
                 ny = 0;
-                nz = (ez + t * dz) / BODY_R;
+                nz = (ez + t * dz) / br;
                 kind = 2;
               }
             }
@@ -508,7 +543,7 @@ export class EntityLayer {
             if (t > Z_MIN && t < bestT) {
               const hx = ex + t * dx;
               const hz = ez + t * dz;
-              if (hx * hx + hz * hz <= BODY_R * BODY_R) {
+              if (hx * hx + hz * hz <= br * br) {
                 bestT = t;
                 nx = 0;
                 ny = 1;
@@ -561,7 +596,7 @@ export class EntityLayer {
           b += (1 - b) * p.flash;
         }
         const fz = (bestT / Z_FAR) * 511;
-        const f = FOG_LUT[fz > 511 ? 511 : fz | 0];
+        const f = FOG_LUT[fz > 511 ? 511 : fz | 0] * PLAYER_FOG;
         r += (FOG_COL[0] - r) * f;
         g += (FOG_COL[1] - g) * f;
         b += (FOG_COL[2] - b) * f;
@@ -736,9 +771,232 @@ export class EntityLayer {
     }
   }
 
+  private bbPts = new Float64Array(3 * 18);
+
+  /** Длина пересечения отрезка [lo, hi] с [a, b] */
+  private static overlap(lo: number, hi: number, a: number, b: number): number {
+    const m = (hi < b ? hi : b) - (lo > a ? lo : a);
+    return m > 0 ? m : 0;
+  }
+
+  /**
+   * Конусный луч как настоящий конус: вершина у руки, ось по лучу, полуугол по заряду.
+   * На каждый пиксель решается пересечение его луча с телом конуса (квадратное уравнение),
+   * яркость — по длине хорды внутри конуса (толще в центре, тоньше к краю) плюс ровная
+   * подложка, поэтому силуэт читается чётким краем. Закрывается землёй по z-буферу
+   * (прошивающий — виден и за ней, вдвое слабее). Раскрывается за первые ~15% жизни и гаснет;
+   * дальний конец тускнеет.
+   */
+  private drawCone(b: DrawBeam): void {
+    const c = this.cam;
+    const ex = b.bx - b.ax;
+    const ey = b.by - b.ay;
+    const ez = b.bz - b.az;
+    const L0 = Math.hypot(ex, ey, ez);
+    if (L0 < 0.5 || b.life <= 0) return;
+    const sweep = Math.min(1, (1 - b.life) * 7 + 0.15);
+    const L = Math.min(L0, CONE_VIS_MAX) * sweep;
+    const ux = ex / L0;
+    const uy = ey / L0;
+    const uz = ez / L0;
+    const k = coneTan(b.c);
+    const k2 = 1 + k * k;
+
+    // Базис кольца: два вектора, перпендикулярные оси
+    let hx = 0;
+    let hy = 1;
+    let hz = 0;
+    if (Math.abs(uy) > 0.95) {
+      hx = 1;
+      hy = 0;
+    }
+    let p1x = uy * hz - uz * hy;
+    let p1y = uz * hx - ux * hz;
+    let p1z = ux * hy - uy * hx;
+    const pl = Math.hypot(p1x, p1y, p1z) || 1;
+    p1x /= pl;
+    p1y /= pl;
+    p1z /= pl;
+    const p2x = uy * p1z - uz * p1y;
+    const p2y = uz * p1x - ux * p1z;
+    const p2z = ux * p1y - uy * p1x;
+
+    // Экранный габарит: вершина и два кольца (на L/2 и L); точки за камерой — весь кадр
+    const NEAR = 0.15;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let front = 0;
+    let behind = 0;
+    const addPt = (x: number, y: number, z: number): void => {
+      const fd = this.depth(x, y, z);
+      if (fd < NEAR) {
+        behind++;
+        return;
+      }
+      front++;
+      const sx = this.screenX(x, y, z, fd);
+      const sy = this.screenY(x, y, z, fd);
+      if (sx < minX) minX = sx;
+      if (sx > maxX) maxX = sx;
+      if (sy < minY) minY = sy;
+      if (sy > maxY) maxY = sy;
+    };
+    addPt(b.ax, b.ay, b.az);
+    for (const f of [0.5, 1]) {
+      const d = L * f;
+      const R = k * d;
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        const cs = Math.cos(a) * R;
+        const sn = Math.sin(a) * R;
+        addPt(b.ax + ux * d + p1x * cs + p2x * sn, b.ay + uy * d + p1y * cs + p2y * sn, b.az + uz * d + p1z * cs + p2z * sn);
+      }
+    }
+    if (front === 0) return;
+    let x0 = 0;
+    let y0 = 0;
+    let x1 = c.W - 1;
+    let y1 = c.H - 1;
+    if (behind === 0) {
+      x0 = Math.max(0, Math.floor(minX) - 1);
+      x1 = Math.min(c.W - 1, Math.ceil(maxX) + 1);
+      y0 = Math.max(0, Math.floor(minY) - 1);
+      y1 = Math.min(c.H - 1, Math.ceil(maxY) + 1);
+      if (x0 > x1 || y0 > y1) return;
+    }
+
+    const rgb = PLAYER_COLORS[b.color % PLAYER_COLORS.length].rgb;
+    const gain = (0.55 + 0.35 * b.c) * b.life;
+    const ox = c.x;
+    const oy = c.y;
+    const oz = c.z;
+    const wx = ox - b.ax;
+    const wy = oy - b.ay;
+    const wz = oz - b.az;
+    const wu = wx * ux + wy * uy + wz * uz;
+    const ww = wx * wx + wy * wy + wz * wz;
+    const C0 = ww - k2 * wu * wu;
+    const { W, focal } = c;
+    const halfW = W / 2;
+    const halfH = c.H / 2;
+    const zbuf = this.zbuf;
+    const pix = this.pix;
+    const ov = EntityLayer.overlap;
+
+    for (let py = y0; py <= y1; py++) {
+      const v = (halfH - py) / focal;
+      const rowBase = py * W;
+      for (let px = x0; px <= x1; px++) {
+        const pi = rowBase + px;
+        const u = (px - halfW) / focal;
+        const dx = this.fx + u * this.rx + v * this.ux;
+        const dy = this.fy + v * this.uy;
+        const dz = this.fz + u * this.rz + v * this.uz;
+        const Du = dx * ux + dy * uy + dz * uz;
+        const DD = dx * dx + dy * dy + dz * dz;
+        const wD = wx * dx + wy * dy + wz * dz;
+        const A2 = DD - k2 * Du * Du;
+        const B2 = 2 * (wD - k2 * wu * Du);
+
+        // Слой по оси: 0 ≤ a ≤ L, a(t) = wu + t·Du
+        let ta0: number;
+        let ta1: number;
+        if (Math.abs(Du) < 1e-9) {
+          if (wu < 0 || wu > L) continue;
+          ta0 = -Infinity;
+          ta1 = Infinity;
+        } else {
+          const t0 = -wu / Du;
+          const t1 = (L - wu) / Du;
+          ta0 = t0 < t1 ? t0 : t1;
+          ta1 = t0 < t1 ? t1 : t0;
+        }
+        const lo = ta0 > Z_MIN ? ta0 : Z_MIN;
+        const zb = zbuf[pi];
+        const hiAll = ta1 < Z_FAR ? ta1 : Z_FAR;
+        if (hiAll <= lo) continue;
+
+        // Где квадрика A2·t² + B2·t + C0 ≤ 0: до двух интервалов
+        let i1lo = 0;
+        let i1hi = -1;
+        let i2lo = 0;
+        let i2hi = -1;
+        if (Math.abs(A2) < 1e-9) {
+          if (Math.abs(B2) < 1e-12) {
+            if (C0 <= 0) {
+              i1lo = -Infinity;
+              i1hi = Infinity;
+            }
+          } else if (B2 > 0) {
+            i1lo = -Infinity;
+            i1hi = -C0 / B2;
+          } else {
+            i1lo = -C0 / B2;
+            i1hi = Infinity;
+          }
+        } else {
+          const disc = B2 * B2 - 4 * A2 * C0;
+          if (disc < 0) {
+            if (A2 < 0) {
+              i1lo = -Infinity;
+              i1hi = Infinity;
+            }
+          } else {
+            const sq = Math.sqrt(disc);
+            let r1 = (-B2 - sq) / (2 * A2);
+            let r2 = (-B2 + sq) / (2 * A2);
+            if (r1 > r2) {
+              const tmp = r1;
+              r1 = r2;
+              r2 = tmp;
+            }
+            if (A2 > 0) {
+              i1lo = r1;
+              i1hi = r2;
+            } else {
+              i1lo = -Infinity;
+              i1hi = r1;
+              i2lo = r2;
+              i2hi = Infinity;
+            }
+          }
+        }
+
+        // Хорда внутри конуса: перед землёй — полностью, за ней (только прошивающий) — вдвое слабее
+        const zCut = zb < hiAll ? zb : hiAll;
+        let chord = ov(i1lo, i1hi, lo, zCut) + ov(i2lo, i2hi, lo, zCut);
+        if (b.pierce) chord += 0.5 * (ov(i1lo, i1hi, lo > zb ? lo : zb, hiAll) + ov(i2lo, i2hi, lo > zb ? lo : zb, hiAll));
+        if (chord <= 0) continue;
+        const chordW = chord * Math.sqrt(DD);
+
+        // Ближе к вершине ярче: плотность падает к дальнему концу
+        const tMid = i1lo > lo ? i1lo : lo;
+        let aMid = (wu + (Number.isFinite(tMid) ? tMid : lo) * Du) / L;
+        aMid = aMid < 0 ? 0 : aMid > 1 ? 1 : aMid;
+        const w = gain * (0.14 + 0.5 * (1 - Math.exp(-chordW * 0.06))) * (1 - 0.6 * aMid);
+        if (w < 0.02) continue;
+        const i = pi * 4;
+        const r = pix[i] / 255 + rgb[0] * w;
+        const g = pix[i + 1] / 255 + rgb[1] * w;
+        const bl = pix[i + 2] / 255 + rgb[2] * w;
+        this.put(pi, px, py, r > 1 ? 1 : r, g > 1 ? 1 : g, bl > 1 ? 1 : bl);
+      }
+    }
+  }
+
   /** Гаджет: парящий шар с тремя спутниками и столб света, видимый издалека */
   private drawGadget(g: DrawGadget, time: number): void {
     const bob = Math.sin(time * 2.2) * 0.12;
+    if (g.coin) {
+      // Монеты: невысокий столб и вращающийся шар — отличаются от гаджета размером
+      for (let k = 0; k < 6; k++) this.disc(g.x, g.y + 0.4 + k * 0.7, g.z, 0.1, g.rgb, 0.3 * (1 - k / 7), 0.2);
+      this.disc(g.x, g.y + 0.9 + bob, g.z, 0.24, g.rgb, 1, 0.2);
+      const a = time * 4;
+      this.disc(g.x + Math.cos(a) * 0.45, g.y + 0.9 + bob, g.z + Math.sin(a) * 0.45, 0.08, [1, 1, 0.6], 0.9, 0.2);
+      return;
+    }
     for (let k = 0; k < 14; k++) {
       this.disc(g.x, g.y + 0.5 + k * 0.9, g.z, 0.16, g.rgb, 0.34 * (1 - k / 16), 0.2);
     }

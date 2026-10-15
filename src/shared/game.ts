@@ -26,8 +26,34 @@ export const BODY_TOP = HEAD_CY - HEAD_R;
 
 // ---------- Палочка и заряды ----------
 
-export const DMG_BODY = 50; // попадание в цилиндр
-export const DMG_HEAD = 150; // попадание в сферу (> MAX_HP: смерть с одного)
+export const DMG_BODY = 70; // урон заряда вблизи (без затухания и крита)
+/** Попадание в голову — крит: урон × столько (у заряда вблизи 140 > MAX_HP: смерть с одного) */
+export const CRIT_MULT = 2;
+
+/**
+ * Затухание урона с дистанцией: до full — полный урон, дальше линейно до доли min
+ * на дистанции far, и ниже min не опускается.
+ */
+export interface Falloff {
+  full: number;
+  far: number;
+  min: number;
+}
+export const BOLT_FALLOFF: Falloff = { full: 12, far: 100, min: 0.4 };
+/** У луча затухание заметно слабее: он хитскан и бьёт на любую дальность */
+export const BEAM_FALLOFF: Falloff = { full: 25, far: 220, min: 0.8 };
+
+/** Множитель урона 1..min для дистанции dist */
+export function falloffMul(dist: number, f: Falloff): number {
+  if (dist <= f.full) return 1;
+  if (dist >= f.far) return f.min;
+  return 1 - (1 - f.min) * ((dist - f.full) / (f.far - f.full));
+}
+
+/** Итоговый урон: база × затухание × крит за голову, целым */
+export function hitDamage(base: number, part: "head" | "body", dist: number, f: Falloff): number {
+  return Math.max(1, Math.round(base * falloffMul(dist, f) * (part === "head" ? CRIT_MULT : 1)));
+}
 export const BOLT_SPEED = 42; // юнитов/с — у заряда настоящая скорость, хитскана нет
 export const BOLT_R = 0.12; // радиус заряда для попаданий
 export const BOLT_LIFE = 3.5; // с до исчезновения (≈ 150 юнитов полёта)
@@ -37,7 +63,7 @@ export const AIM_DIST = 40; // заряд вылетает из руки и сх
 // ---------- Заряженный выстрел (ПКМ): луч-хитскан ----------
 
 export const BEAM_CHARGE_TIME = 3; // с удержания до полного заряда
-export const BEAM_DMG_MIN = 10; // урон и цена незаряженного выстрела
+export const BEAM_DMG_MIN = 20; // урон незаряженного выстрела (цена — BEAM_COST_MIN)
 export const BEAM_DMG_MAX = 300;
 export const BEAM_COST_MIN = 10;
 export const BEAM_COST_MAX = 100;
@@ -51,6 +77,45 @@ export const BEAM_PIERCE_AT = 0.999;
 export const beamDamage = (c: number): number => BEAM_DMG_MIN + (BEAM_DMG_MAX - BEAM_DMG_MIN) * c;
 /** Базовая цена маны при заряде c (до множителя «экономного выстрела») */
 export const beamCost = (c: number): number => BEAM_COST_MIN + (BEAM_COST_MAX - BEAM_COST_MIN) * c;
+
+// ---------- Монеты ----------
+
+export const COIN_FIXED = 100; // монет падает с убитого всегда
+export const COIN_LOSS = 0.4; // и ещё такая доля его текущих монет (он их теряет)
+export const COIN_TTL = 120; // с лежат на земле, пока не подобрали
+export const COIN_PICK_R = 1.8; // радиус подбора, юниты
+
+// ---------- Конусный луч (покупка в магазине) ----------
+
+export const CONE_DMG_MULT = 5; // урон луча ×
+export const CONE_R0 = 0.3; // радиус конуса у стрелка, юниты
+/** Полуугол конуса: без заряда 15°, чем сильнее заряд, тем уже — до 20% (12° при полном) */
+export const CONE_ANGLE_DEG = 15;
+export const CONE_FOCUS = 0.2;
+export const CONE_R_REF = 1.5; // до этого радиуса сечения дальность урон не режет, шире — обратно пропорционально
+export const CONE_EDGE_LOSS = 0.9; // потеря урона на самой границе конуса (в центре — 0)
+/** Радиус конуса на дистанции d при заряде c (0..1) */
+export const coneTan = (c: number): number => Math.tan(((CONE_ANGLE_DEG * (1 - CONE_FOCUS * Math.min(1, Math.max(0, c)))) * Math.PI) / 180);
+export const coneRadius = (d: number, c: number): number => CONE_R0 + d * coneTan(c);
+/** Множитель по дальности: чем шире сечение конуса (радиус r) в точке попадания, тем слабее удар */
+export const coneRangeFactor = (r: number): number => Math.min(1, CONE_R_REF / Math.max(r, 1e-3));
+/**
+ * Множитель по положению в сечении: rel = расстояние от оси / радиус сечения. На оси потерь
+ * нет, на границе — CONE_EDGE_LOSS, между ними линейно.
+ */
+export const coneAxisFactor = (rel: number): number => 1 - CONE_EDGE_LOSS * Math.min(1, Math.max(0, rel));
+/** Итоговая доля урона: по дальности × по удалению от оси */
+export const coneFactor = (r: number, rel: number): number => coneRangeFactor(r) * coneAxisFactor(rel);
+
+// ---------- Вампиризм (покупка в магазине) ----------
+
+export const VAMP_HEAL = 0.3; // доля нанесённого урона, возвращаемая атакующему
+
+// ---------- Остановка времени (покупка в магазине) ----------
+
+export const FREEZE_BEAM = 0.5; // с: заморозка от обычного попадания альтернативным выстрелом
+export const FREEZE_CONE_MAX = 1; // с: заморозка конусом при попадании ровно по оси вблизи
+export const FREEZE_CONE_MIN = 0.15; // с: меньше этого конус не замораживает, если вообще задел
 
 // ---------- Мана ----------
 
@@ -154,6 +219,10 @@ export interface MeSnap {
   perks: string[];
   /** Активный гаджет и сколько секунд ему осталось */
   gadget: { id: string; left: number } | null;
+  /** Монеты в кармане */
+  gold: number;
+  /** Купленные в магазине улучшения (id из shop.ts) */
+  shop: string[];
   /** Щит заряжен */
   shield: boolean;
   /** Заряд луча 0..1 (-1 — не заряжаю) */
@@ -186,7 +255,9 @@ export type ClientMsg =
   | ({ t: "release" } & PoseMsg)
   /** Заряд сорван (смерть, потеря фокуса) без выстрела */
   | { t: "cancel" }
-  | { t: "bot"; op: "add" | "remove" };
+  | { t: "bot"; op: "add" | "remove" }
+  /** Купить улучшение в магазине (сервер проверяет цену) */
+  | { t: "buy"; id: string };
 
 export type ServerMsg =
   | { t: "welcome"; id: number; color: number; seed: number; spawn: { x: number; z: number } }
@@ -195,7 +266,7 @@ export type ServerMsg =
   | { t: "shot"; id: number; owner: number; x: number; y: number; z: number; vx: number; vy: number; vz: number; r: number }
   /** Заряд закончился: попал в игрока (part, victim) или в землю/по таймеру */
   /** Луч (заряженный выстрел): из руки в конечную точку; c — заряд 0..1, pierce — пробил рельеф */
-  | { t: "beam"; owner: number; x: number; y: number; z: number; ex: number; ey: number; ez: number; c: number; pierce: boolean; big: boolean }
+  | { t: "beam"; owner: number; x: number; y: number; z: number; ex: number; ey: number; ez: number; c: number; pierce: boolean; big: boolean; cone?: boolean }
   | { t: "pend"; id: number; x: number; y: number; z: number; part: HitPart | null; victim: number }
   /** absorbed — попадание поглотил щит (урона нет) */
   | { t: "hit"; attacker: number; victim: number; part: HitPart; dmg: number; hp: number; absorbed: boolean }
@@ -212,4 +283,10 @@ export type ServerMsg =
   | { t: "note"; text: string }
   | ({ t: "gadget" } & GadgetMsg)
   /** Гаджет с карты исчез: by — кто подобрал (0 — истёк) */
-  | { t: "gadgetEnd"; id: number; by: number };
+  | { t: "gadgetEnd"; id: number; by: number }
+  /** Монеты на земле (выпали с убитого) */
+  | { t: "coin"; id: number; x: number; y: number; z: number; amount: number }
+  /** Игрок застыл на dur секунд: не двигается, не поворачивает камеру и не стреляет */
+  | { t: "freeze"; id: number; dur: number }
+  /** Монеты исчезли: by — кто подобрал (0 — истекли) */
+  | { t: "coinGone"; id: number; by: number; amount: number };

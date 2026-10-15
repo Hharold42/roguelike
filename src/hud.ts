@@ -4,16 +4,17 @@
  * вся раскладка и стили в index.html и style.css, здесь лишь значения.
  */
 
-import { BEAM_PIERCE_AT, MAX_HP, PLAYER_COLORS, beamDamage, colorCss } from "./shared/game";
+import { BEAM_PIERCE_AT, CONE_DMG_MULT, MAX_HP, PLAYER_COLORS, beamDamage, colorCss } from "./shared/game";
 import { gadgetById, perkById, slightById } from "./shared/balance";
+import { SHOP_ITEMS } from "./shared/shop";
 import { GADGET_RGB } from "./session";
-import type { KillEvent, Session } from "./session";
+import type { DamageNumber, KillEvent, Session } from "./session";
 
 const FEED_MAX = 5;
 const FEED_LIFE_MS = 5000;
 const TOAST_MAX = 4;
 const TOAST_LIFE_MS = 4000;
-const ARROW_POOL = 3; // два пинга радара и стрелка к гаджету
+const ARROW_POOL = 4; // два пинга радара, стрелка к гаджету и к ближайшим монетам
 
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
 
@@ -25,6 +26,7 @@ export class Hud {
   private readonly manaBar = this.manaFill.parentElement!;
   private readonly crosshair = $("crosshair");
   private readonly damage = $("damage");
+  private readonly freezeFx = $("freeze");
   private readonly overlay = $("overlay");
   private readonly feed = $("feed");
   private readonly board = $("scoreboard");
@@ -35,6 +37,14 @@ export class Hud {
   private readonly chargeText = $("chargeText");
   private readonly loadout = $("loadout");
   private readonly toasts = $("toasts");
+  private readonly gold = $("gold");
+  private readonly shop = $("shop");
+  private shopOpen = false;
+  private shopKey = "";
+  /** Покупка: main пересылает серверу */
+  onBuy: ((id: string) => void) | null = null;
+  private readonly dmgHost = $("dmgNums");
+  private readonly dmgNums: HTMLElement[] = [];
   private readonly arrows: HTMLElement[] = [];
   private readonly arrowLabels: HTMLElement[] = [];
   private identity = "";
@@ -53,6 +63,51 @@ export class Hud {
       this.arrows.push(a);
       this.arrowLabels.push(label);
     }
+  }
+
+  get isShopOpen(): boolean {
+    return this.shopOpen;
+  }
+
+  /** Окно магазина: открыть/закрыть (force — задать явно) */
+  toggleShop(force?: boolean): void {
+    this.shopOpen = force ?? !this.shopOpen;
+    this.shop.style.display = this.shopOpen ? "block" : "none";
+    this.shopKey = "";
+  }
+
+  /** Купить товар по номеру в списке (клавиши 1…9) */
+  buyByIndex(i: number): void {
+    const item = SHOP_ITEMS[i];
+    if (item) this.onBuy?.(item.id);
+  }
+
+  /** Список товаров: цена, состояние (куплено / хватает / не хватает); перестраивается при смене монет или покупок */
+  private updateShop(s: Session): void {
+    const me = s.me;
+    this.gold.textContent = `◆ ${me.gold}`;
+    if (!this.shopOpen) return;
+    const key = `${me.gold}|${me.shop.join(",")}`;
+    if (key === this.shopKey) return;
+    this.shopKey = key;
+    const head = document.createElement("div");
+    head.className = "shop-head";
+    head.textContent = `Магазин · ◆ ${me.gold} · E — закрыть · 1…9 — купить`;
+    const rows = SHOP_ITEMS.map((item, i) => {
+      const owned = me.shop.includes(item.id);
+      const row = document.createElement("div");
+      row.className = `shop-row ${owned ? "owned" : me.gold >= item.price ? "can" : "cant"}`;
+      const title = document.createElement("div");
+      title.className = "shop-title";
+      title.textContent = `[${i + 1}] ${item.title} — ${owned ? "куплено" : `${item.price} ◆`}`;
+      const desc = document.createElement("div");
+      desc.className = "shop-desc";
+      desc.textContent = item.desc;
+      row.append(title, desc);
+      row.addEventListener("click", () => this.onBuy?.(item.id));
+      return row;
+    });
+    this.shop.replaceChildren(head, ...rows);
   }
 
   /** Всплывающая подсказка (полученное улучшение, сработавший перк) */
@@ -123,19 +178,21 @@ export class Hud {
     this.crosshair.classList.toggle("hit", s.hitMarker > 0);
     this.crosshair.classList.toggle("head", s.hitMarker > 0 && s.hitMarkerHead);
     this.damage.style.opacity = String(s.damageFlash * 0.6);
+    this.freezeFx.style.opacity = String(s.frozen > 0 ? Math.min(1, (s.frozen / 0.25) * 1) : 0);
 
     if (!me.alive) this.say(`Вы погибли · возрождение через ${Math.ceil(me.respawn)}`);
     else if (this.overlay.style.display === "block" && this.overlay.dataset.dead === "1") this.say(null);
     this.overlay.dataset.dead = me.alive ? "0" : "1";
 
-    this.updateCharge(me.charge, me.alive);
+    this.updateCharge(me.charge, me.alive, me.shop.includes("cone") ? CONE_DMG_MULT : 1);
     this.updateBoard(s);
     this.updateLoadout(s);
+    this.updateShop(s);
     this.updateArrows(s, yaw);
   }
 
   /** Полоска заряда луча под прицелом: урон растёт, на полном — «прошивает» */
-  private updateCharge(c: number, alive: boolean): void {
+  private updateCharge(c: number, alive: boolean, dmgMul: number): void {
     const on = alive && c >= 0;
     this.chargeBar.classList.toggle("on", on);
     this.scope.style.opacity = on ? String(Math.min(1, c * 1.2)) : "0";
@@ -143,7 +200,7 @@ export class Hud {
     this.chargeFill.style.width = `${c * 100}%`;
     const full = c >= BEAM_PIERCE_AT;
     this.chargeBar.classList.toggle("full", full);
-    this.chargeText.textContent = full ? `${Math.round(beamDamage(c))} · прошивает землю · эхолокация` : `${Math.round(beamDamage(c))} урона`;
+    this.chargeText.textContent = full ? `${Math.round(beamDamage(c) * dmgMul)} · прошивает землю · эхолокация` : `${Math.round(beamDamage(c) * dmgMul)} урона${dmgMul > 1 ? " вблизи по оси" : ""}`;
   }
 
   /** Чипы: стопки лёгких улучшений, перк за смерть, гаджет с таймером */
@@ -177,6 +234,34 @@ export class Hud {
     if (this.gadgetChip && me.gadget) this.gadgetChip.textContent = `${this.gadgetChip.dataset.title} · ${Math.ceil(me.gadget.left)} с`;
   }
 
+  /**
+   * Цифры урона у врагов: каждая привязана к точке в мире, всплывает вверх и гаснет.
+   * project — проекция мира на экран (доли 0..1) из рендера; элементы переиспользуются.
+   */
+  drawDamageNumbers(list: readonly DamageNumber[], project: (x: number, y: number, z: number) => { sx: number; sy: number; depth: number } | null): void {
+    let used = 0;
+    for (const n of list) {
+      const p = project(n.x, n.y + n.age * 1.1, n.z);
+      if (!p || p.sx < -0.1 || p.sx > 1.1 || p.sy < -0.1 || p.sy > 1.1) continue;
+      let el = this.dmgNums[used];
+      if (!el) {
+        el = document.createElement("div");
+        this.dmgHost.append(el);
+        this.dmgNums.push(el);
+      }
+      used++;
+      const text = n.dmg > 0 ? String(n.dmg) : "щит";
+      if (el.textContent !== text) el.textContent = text;
+      el.className = n.dmg <= 0 ? "dmg shield" : n.head ? "dmg head" : "dmg";
+      // Размер падает с расстоянием, в первые мгновения цифра «выскакивает»
+      const pop = n.age < 0.12 ? 1.5 - (n.age / 0.12) * 0.5 : 1;
+      const scale = Math.min(1.7, Math.max(0.75, 16 / p.depth)) * pop;
+      el.style.transform = `translate(${p.sx * window.innerWidth + n.jx}px, ${p.sy * window.innerHeight}px) translate(-50%, -50%) scale(${scale})`;
+      el.style.opacity = String(Math.min(1, (n.ttl - n.age) / 0.3));
+    }
+    for (let i = used; i < this.dmgNums.length; i++) this.dmgNums[i].className = "dmg off";
+  }
+
   /** Стрелки вокруг прицела: пинги радара и направление на гаджет на карте */
   private updateArrows(s: Session, yaw: number): void {
     const me = s.myPos;
@@ -203,6 +288,8 @@ export class Hud {
         const rgb = GADGET_RGB[g.kind] ?? [1, 1, 1];
         show(g.x, g.z, `rgb(${rgb.map((v) => Math.round(v * 255)).join(",")})`);
       }
+      const coin = s.nearestCoin();
+      if (coin) show(coin.x, coin.z, "rgb(255,209,46)");
     }
     for (let i = n; i < this.arrows.length; i++) this.arrows[i].style.display = "none";
   }

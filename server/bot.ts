@@ -25,7 +25,7 @@
  */
 
 import { BASE_SPEED, GRAVITY_DOWN, GRAVITY_UP, GROUND_ACCEL, AIR_ACCEL, JUMP_SPEED, Player, SPRINT_MULT, type MoveInput } from "../src/player";
-import { BEAM_DMG_MAX, BEAM_DMG_MIN, CROUCH_DROP, beamCost } from "../src/shared/game";
+import { BEAM_DMG_MAX, BEAM_DMG_MIN, BEAM_FALLOFF, CROUCH_DROP, beamCost, falloffMul } from "../src/shared/game";
 import { BASE_STATS } from "../src/shared/balance";
 import { segmentVsBody } from "../src/shared/hitbox";
 
@@ -74,9 +74,14 @@ export interface BotCtx {
   enemies: readonly BotBody[];
   bolts: readonly BotBolt[];
   gadget: { x: number; y: number; z: number } | null;
-  groundAt: (x: number, z: number) => number;
-  /** Верх построек с запасом на радиус тела (−∞ — пусто): стены останавливают бота */
-  solidTopAt: (x: number, z: number) => number;
+  /** Монеты на земле: боты их подбирают */
+  coins: readonly { x: number; z: number }[];
+  /** Опора под ступнями на высоте y (земля, постройки, летающие платформы) */
+  groundAt: (x: number, z: number, y: number) => number;
+  /** Не пускает ли постройка тело бота в точку (стены останавливают) */
+  blocked: (x: number, z: number, y: number) => boolean;
+  /** Твёрдая ли точка мира (земля, стена, платформа) — для линии видимости */
+  blockedAt: (x: number, y: number, z: number) => boolean;
   /** Половина размера мира (невидимая стена) */
   bound: number;
 }
@@ -94,6 +99,14 @@ export interface BotOut {
 }
 
 // ---------- Вспомогательное ----------
+
+/** Зрение бота: дальность (меньше дальности тумана игрока), полуугол поля зрения, слух выстрелов */
+const SIGHT_RANGE = 90;
+const SIGHT_CONE = 1.4; // рад (~80° в каждую сторону)
+const ALERT_RANGE = 140;
+const HEAR_BOLT = 70;
+/** Сколько секунд после потери из виду бот ещё «чувствует» врага (звук, инерция) */
+const MEMORY = 1.0;
 
 const rnd = (a: number, b: number): number => a + Math.random() * (b - a);
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
@@ -185,7 +198,7 @@ class Tracker {
   }
 
   /** Новый замер позиции (раз в тик); perp — вправо от линии «бот → цель» */
-  observe(now: number, b: BotBody, perpX: number, perpZ: number, groundAt: (x: number, z: number) => number): void {
+  observe(now: number, b: BotBody, perpX: number, perpZ: number, groundAt: (x: number, z: number, y: number) => number): void {
     const last = this.samples[this.samples.length - 1];
     if (last && Math.hypot(b.x - last.x, b.z - last.z) > 8) this.reset(); // возрождение — новая «жизнь»
     this.samples.push({ t: now, x: b.x, y: b.y, z: b.z });
@@ -200,7 +213,7 @@ class Tracker {
       this.vy = (b.y - a.y) / dt;
       this.vz = (b.z - a.z) / dt;
     }
-    this.grounded = b.y - groundAt(b.x, b.z) < 0.12;
+    this.grounded = b.y - groundAt(b.x, b.z, b.y) < 0.12;
 
     // Смены боковой скорости — по ним ищем период стрейфа
     const vlat = this.vx * perpX + this.vz * perpZ;
@@ -236,7 +249,7 @@ class Tracker {
   }
 
   /** Положение ступней цели через T секунд по модели */
-  predict(model: Model, T: number, now: number, perpX: number, perpZ: number, groundAt: (x: number, z: number) => number): Vec3 {
+  predict(model: Model, T: number, now: number, perpX: number, perpZ: number, groundAt: (x: number, z: number, y: number) => number): Vec3 {
     const p = this.pos;
     let x = p.x;
     let z = p.z;
@@ -264,7 +277,7 @@ class Tracker {
       x += lat * perpX;
       z += lat * perpZ;
     }
-    const gr = groundAt(x, z);
+    const gr = groundAt(x, z, p.y);
     let y = p.y;
     if (model !== "static" && !this.grounded) y = ballistic(p.y, this.vy, T, gr);
     else if (this.grounded) y = gr;
@@ -385,6 +398,8 @@ export class BotBrain {
     this.dodge = "none";
     this.beamOn = false;
     this.seen.clear();
+    this.seenSince.clear();
+    this.lastSeen.clear();
     this.wp = null;
     this.target = 0;
     this.pitch = 0;
@@ -407,8 +422,9 @@ export class BotBrain {
 
     // 1. Наблюдение за врагами
     const alive = new Set<number>();
+    this.perceive(ctx, now, ex, pl.eyeY(), ez);
     for (const e of ctx.enemies) {
-      if (!e.alive) continue;
+      if (!e.alive || !this.isTracked(e.id, now)) continue; // не замечен — не наблюдаем
       alive.add(e.id);
       let tr = this.trackers.get(e.id);
       if (!tr) this.trackers.set(e.id, (tr = new Tracker()));
@@ -426,7 +442,7 @@ export class BotBrain {
       this.nextRetarget = now + 0.2;
       this.pickTarget(ctx, ex, eyeY, ez, now);
     }
-    const tb = ctx.enemies.find((e) => e.id === this.target && e.alive) ?? null;
+    const tb = ctx.enemies.find((e) => e.id === this.target && e.alive && this.isTracked(e.id, now)) ?? null;
     const tr = tb ? this.trackers.get(tb.id)! : null;
 
     // 3. Прицел и выстрел
@@ -445,8 +461,63 @@ export class BotBrain {
     const input = this.unstick(this.movement(ctx, tb, tr, dist, los, now), now);
 
     // 5. Физика и вывод
-    pl.update(dt, input, this.yaw, ctx.groundAt, ctx.bound, ctx.solidTopAt);
+    pl.update(dt, input, this.yaw, ctx.groundAt, ctx.bound, ctx.blocked);
     return { x: pl.x, y: pl.y, z: pl.z, yaw: this.yaw, pitch: this.pitch, crouch: pl.crouch, shoot, beam };
+  }
+
+  // ---------- Восприятие ----------
+
+  /** Начало непрерывного наблюдения за врагом (для задержки опознания) и время последнего взгляда */
+  private readonly seenSince = new Map<number, { since: number; looked: number }>();
+  /** Где и когда враг был замечен в последний раз */
+  private readonly lastSeen = new Map<number, { t: number; x: number; z: number }>();
+  private nextPerceive = 0;
+
+  /** Враг «на сопровождении»: замечен сейчас или потерян из виду не дольше MEMORY с назад */
+  private isTracked(id: number, now: number): boolean {
+    const s = this.lastSeen.get(id);
+    return s !== undefined && now - s.t < MEMORY;
+  }
+
+  /**
+   * Зрение и слух: бот не знает, где враги, пока их не заметит. Заметить можно в пределах
+   * SIGHT_RANGE, в поле зрения (конус) и по прямой видимости; опознание занимает долю секунды
+   * (дальше — дольше). Вне конуса и дальше — только по слуху: враг, стреляющий рядом, и тот,
+   * кто только что попал в бота, обнаруживаются сразу (но видимость всё равно нужна).
+   */
+  private perceive(ctx: BotCtx, now: number, ex: number, eyeY: number, ez: number): void {
+    if (now < this.nextPerceive) return;
+    this.nextPerceive = now + 0.1;
+    const heard = new Set<number>();
+    for (const b of ctx.bolts) {
+      if (b.owner !== ctx.selfId && Math.hypot(b.x - ex, b.z - ez) < HEAR_BOLT) heard.add(b.owner);
+    }
+    for (const e of ctx.enemies) {
+      if (!e.alive) continue;
+      const dx = e.x - ex;
+      const dz = e.z - ez;
+      const dist = Math.hypot(dx, dz);
+      const alerted = heard.has(e.id) || (e.id === this.hurtBy && now - this.hurtT < 1.5);
+      const range = alerted ? ALERT_RANGE : SIGHT_RANGE * (1 - 0.25 * e.crouch);
+      let seen = dist <= range;
+      if (seen && !alerted && dist > 8 && Math.abs(wrap(Math.atan2(dx, dz) - this.yaw)) > SIGHT_CONE) seen = false;
+      if (seen && !this.hasLOS(ctx, ex, eyeY, ez, e.x, e.y + 1.2 - CROUCH_DROP * e.crouch, e.z)) seen = false;
+
+      const st = this.seenSince.get(e.id);
+      if (!seen) {
+        if (st && now - st.looked > 0.35) this.seenSince.delete(e.id);
+        continue;
+      }
+      if (!st) {
+        this.seenSince.set(e.id, { since: now, looked: now });
+        continue;
+      }
+      st.looked = now;
+      // Опознание: чем дальше враг, тем дольше; плохие бойцы медлят больше
+      if (now - st.since >= 0.12 + dist / 170 + this.acquireDelay * 0.5) {
+        this.lastSeen.set(e.id, { t: now, x: e.x, z: e.z });
+      }
+    }
   }
 
   // ---------- Цель ----------
@@ -455,7 +526,7 @@ export class BotBrain {
     let best = 0;
     let bestScore = Infinity;
     for (const e of ctx.enemies) {
-      if (!e.alive) continue;
+      if (!e.alive || !this.isTracked(e.id, now)) continue;
       const d = Math.hypot(e.x - ex, e.z - ez);
       let s = d;
       if (!this.hasLOS(ctx, ex, ey, ez, e.x, e.y + 1.2, e.z)) s += 25;
@@ -468,6 +539,14 @@ export class BotBrain {
       }
     }
     if (best !== this.target) {
+      if (best === 0) {
+        // Цель потеряна из виду — идём искать туда, где её видели в последний раз
+        const last = this.lastSeen.get(this.target);
+        if (last) {
+          this.wp = { x: last.x + rnd(-5, 5), z: last.z + rnd(-5, 5) };
+          this.wpUntil = now + 8;
+        }
+      }
       this.target = best;
       this.fireAfter = now + this.acquireDelay; // время «увидеть» новую цель
     }
@@ -482,7 +561,7 @@ export class BotBrain {
       const s = i / n;
       const x = ax + (bx - ax) * s;
       const z = az + (bz - az) * s;
-      if (ay + (by - ay) * s < ctx.groundAt(x, z) + 0.15) return false;
+      if (ctx.blockedAt(x, ay + (by - ay) * s - 0.15, z)) return false;
     }
     return true;
   }
@@ -626,7 +705,9 @@ export class BotBrain {
     let c = 0;
     let pierce = false;
     if (los && dist >= 26 && dist <= 130) {
-      c = clamp((tb.hp + 5 - BEAM_DMG_MIN) / (BEAM_DMG_MAX - BEAM_DMG_MIN), 0.04, 1);
+      // Нужный урон с запасом, с поправкой на затухание по дальности (крит за голову в расчёт не берём)
+      const need = (tb.hp + 5) / falloffMul(dist, BEAM_FALLOFF);
+      c = clamp((need - BEAM_DMG_MIN) / (BEAM_DMG_MAX - BEAM_DMG_MIN), 0.04, 1);
       if (Math.random() > 0.65 || s.mana < beamCost(c) * k + 15) return "none";
     } else if (!los && dist <= 70) {
       c = 1;
@@ -667,9 +748,24 @@ export class BotBrain {
     const gd = gadget ? Math.hypot(gadget.x - ex, gadget.z - ez) : Infinity;
     const busy = tb !== null && los && dist < 16;
 
+    let cd = Infinity;
+    let coin: { x: number; z: number } | null = null;
+    for (const c of ctx.coins) {
+      const d = Math.hypot(c.x - ex, c.z - ez);
+      if (d < cd) {
+        cd = d;
+        coin = c;
+      }
+    }
+
     if (gadget && gd < 75 && !busy) {
       wx = (gadget.x - ex) / (gd || 1);
       wz = (gadget.z - ez) / (gd || 1);
+      sprint = true;
+      this.maybeHop(now, true);
+    } else if (coin && cd < 50 && !busy) {
+      wx = (coin.x - ex) / (cd || 1);
+      wz = (coin.z - ez) / (cd || 1);
       sprint = true;
       this.maybeHop(now, true);
     } else if (tb && tr) {

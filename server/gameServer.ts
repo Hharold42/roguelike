@@ -23,6 +23,8 @@ import { Terrain } from "../src/terrain";
 import { ColumnMap, WORLD_SIZE } from "../src/soft/columnMap";
 import { segmentVsBody, type Hit } from "../src/shared/hitbox";
 import { BotBrain } from "./bot";
+import { BODY_R as BODY_RADIUS, COIN_FIXED, COIN_LOSS, COIN_PICK_R, COIN_TTL, CONE_DMG_MULT, CRIT_MULT, FREEZE_BEAM, FREEZE_CONE_MAX, FREEZE_CONE_MIN, VAMP_HEAL, coneFactor, coneRadius } from "../src/shared/game";
+import { SHOP_ITEMS, applyShopStats, shopItemById } from "../src/shared/shop";
 import { COLLIDE_R } from "../src/player";
 import {
   AIM_DIST,
@@ -38,7 +40,9 @@ import {
   BOLT_LIFE,
   CROUCH_DROP,
   DMG_BODY,
-  DMG_HEAD,
+  BEAM_FALLOFF,
+  BOLT_FALLOFF,
+  hitDamage,
   EYE_HEIGHT,
   HEAD_R,
   MAX_BOTS,
@@ -123,6 +127,20 @@ interface PlayerState {
   /** Секунд до второго луча «Эха» (< 0 — нет) и его заряд */
   beamEchoT: number;
   beamEchoC: number;
+  /** Монеты и купленные в магазине улучшения (не сбрасываются смертью, кроме потерянных монет) */
+  gold: number;
+  shop: Set<string>;
+  /** Секунд до конца «остановки времени» (> 0 — игрок застыл) */
+  frozenT: number;
+}
+
+interface Coin {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  amount: number;
+  ttl: number;
 }
 
 interface Bolt {
@@ -136,6 +154,10 @@ interface Bolt {
   vz: number;
   r: number;
   life: number;
+  /** Откуда вылетел — для затухания урона с дистанцией */
+  ox: number;
+  oy: number;
+  oz: number;
 }
 
 interface WorldGadget extends GadgetMsg {
@@ -202,6 +224,8 @@ export class GameServer {
   private hostId = 0;
   private gadget: WorldGadget | null = null;
   private gadgetTimer = GADGET_SPAWN_INTERVAL;
+  private coins: Coin[] = [];
+  private nextCoinId = 1;
 
   constructor(seed?: number) {
     this.seed = seed ?? Math.floor(Math.random() * 1e9);
@@ -270,6 +294,9 @@ export class GameServer {
       chargeT: 0,
       beamEchoT: -1,
       beamEchoC: 0,
+      gold: 0,
+      shop: new Set<string>(),
+      frozenT: 0,
     };
     this.players.set(p.id, p);
     console.info(`[game] +${ws ? "игрок" : "бот"} #${p.id} (${PLAYER_COLORS[p.color].name}), всего ${this.players.size}`);
@@ -283,6 +310,7 @@ export class GameServer {
     this.send(p, { t: "welcome", id: p.id, color: p.color, seed: this.seed, spawn: { x: p.x, z: p.z } });
     this.send(p, { t: "host", host: p.id === this.hostId });
     if (this.gadget) this.send(p, { t: "gadget", ...this.gadget });
+    for (const c of this.coins) this.send(p, { t: "coin", id: c.id, x: c.x, y: c.y, z: c.z, amount: c.amount });
 
     ws.on("message", (data) => {
       let msg: ClientMsg;
@@ -329,6 +357,10 @@ export class GameServer {
       p.charging = false;
       return;
     }
+    if (msg.t === "buy") {
+      this.buy(p, msg.id);
+      return;
+    }
     if (msg.t !== "pose" && msg.t !== "shoot" && msg.t !== "charge" && msg.t !== "release") return;
     if (!p.alive || !this.applyPose(p, msg)) return;
     if (msg.t === "shoot") this.tryShoot(p);
@@ -373,7 +405,7 @@ export class GameServer {
   private tickBots(dt: number): void {
     const bodies = [...this.players.values()];
     for (const p of bodies) {
-      if (!p.bot || !p.alive) continue;
+      if (!p.bot || !p.alive || p.frozenT > 0) continue; // застывший бот не думает и не двигается
       const out = p.bot.update(dt, {
         now: this.clock,
         selfId: p.id,
@@ -381,8 +413,10 @@ export class GameServer {
         enemies: bodies.filter((q) => q !== p && q.alive),
         bolts: this.bolts,
         gadget: this.gadget,
-        groundAt: (x, z) => this.map.heightAt(x, z),
-        solidTopAt: (x, z) => this.map.structures.solidTopAt(x, z, COLLIDE_R),
+        coins: this.coins,
+        groundAt: (x, z, y) => this.map.groundAt(x, z, y),
+        blocked: (x, z, y) => this.map.structures.blocks(x, z, y, COLLIDE_R),
+        blockedAt: (x, y, z) => this.map.blockedAt(x, y, z),
         bound: WORLD_BOUND,
       });
       p.x = out.x;
@@ -401,6 +435,7 @@ export class GameServer {
 
   /** Принять позу клиента с проверкой чисел и границ мира */
   private applyPose(p: PlayerState, m: PoseMsg): boolean {
+    if (p.frozenT > 0) return false; // застывший стоит на месте: поза и действия игнорируются
     if (![m.x, m.y, m.z, m.yaw, m.pitch, m.crouch].every(finite)) return false;
     p.x = clamp(m.x, -WORLD_BOUND, WORLD_BOUND);
     p.z = clamp(m.z, -WORLD_BOUND, WORLD_BOUND);
@@ -417,6 +452,7 @@ export class GameServer {
   private recompute(p: PlayerState): void {
     const oldMax = p.stats.manaMax;
     p.stats = computeStats(p.loadout);
+    applyShopStats(p.stats, p.shop);
     if (p.stats.manaMax > oldMax) p.mana += p.stats.manaMax - oldMax;
     p.mana = Math.min(p.mana, p.stats.manaMax);
   }
@@ -450,6 +486,70 @@ export class GameServer {
     l.perks.push(def.id);
     this.send(p, { t: "upgrade", tier: "normal", id: def.id, stacks: l.perks.filter((id) => id === def.id).length });
     this.recompute(p);
+  }
+
+  // ---------- Монеты и магазин ----------
+
+  /** Смерть: с убитого падает COIN_FIXED монет и COIN_LOSS его текущих (он их теряет) */
+  private dropCoins(victim: PlayerState): void {
+    const lost = Math.floor(victim.gold * COIN_LOSS);
+    victim.gold -= lost;
+    const coin: Coin = {
+      id: this.nextCoinId++,
+      x: victim.x,
+      y: this.map.groundAt(victim.x, victim.z, victim.y),
+      z: victim.z,
+      amount: COIN_FIXED + lost,
+      ttl: COIN_TTL,
+    };
+    this.coins.push(coin);
+    this.broadcast({ t: "coin", id: coin.id, x: coin.x, y: coin.y, z: coin.z, amount: coin.amount });
+  }
+
+  /** Время жизни монет и подбор: первый, кто вошёл в радиус */
+  private tickCoins(dt: number): void {
+    const left: Coin[] = [];
+    for (const c of this.coins) {
+      c.ttl -= dt;
+      if (c.ttl <= 0) {
+        this.broadcast({ t: "coinGone", id: c.id, by: 0, amount: c.amount });
+        continue;
+      }
+      let taker: PlayerState | null = null;
+      let best = COIN_PICK_R;
+      for (const p of this.players.values()) {
+        if (!p.alive) continue;
+        const d = Math.hypot(p.x - c.x, p.z - c.z);
+        if (d < best && Math.abs(p.y - c.y) < 2.5) {
+          best = d;
+          taker = p;
+        }
+      }
+      if (!taker) {
+        left.push(c);
+        continue;
+      }
+      taker.gold += c.amount;
+      this.broadcast({ t: "coinGone", id: c.id, by: taker.id, amount: c.amount });
+      if (taker.bot) for (const item of SHOP_ITEMS) this.buy(taker, item.id);
+    }
+    this.coins = left;
+  }
+
+  /** Покупка в магазине: цена списывается, улучшение навсегда */
+  private buy(p: PlayerState, id: unknown): void {
+    const item = typeof id === "string" ? shopItemById(id) : undefined;
+    if (!item) return;
+    if (p.shop.has(item.id)) {
+      this.send(p, { t: "note", text: `«${item.title}» уже куплено` });
+    } else if (p.gold < item.price) {
+      this.send(p, { t: "note", text: `Не хватает монет: «${item.title}» стоит ${item.price}, у вас ${p.gold}` });
+    } else {
+      p.gold -= item.price;
+      p.shop.add(item.id);
+      this.recompute(p); // «Глубокий резервуар» и «Лёгкая поступь» меняют характеристики
+      this.send(p, { t: "note", text: `★ Куплено: ${item.title}` });
+    }
   }
 
   // ---------- Гаджеты на карте ----------
@@ -608,7 +708,7 @@ export class GameServer {
     vy *= k;
     vz *= k;
 
-    const bolt: Bolt = { id: this.nextBoltId++, owner: p.id, x: ox, y: oy, z: oz, vx, vy, vz, r: radius, life: BOLT_LIFE };
+    const bolt: Bolt = { id: this.nextBoltId++, owner: p.id, x: ox, y: oy, z: oz, vx, vy, vz, r: radius, life: BOLT_LIFE, ox, oy, oz };
     this.broadcast({ t: "shot", id: bolt.id, owner: p.id, x: ox, y: oy, z: oz, vx, vy, vz, r: radius });
     // Путь «глаз → рука»: вплотную к цели заряд не должен рождаться внутри неё
     const first = this.sweepPlayers(bolt.owner, p.x, eyeY, p.z, ox, oy, oz, radius);
@@ -668,7 +768,7 @@ export class GameServer {
   /**
    * Луч: мгновенный отрезок от глаз по взгляду. Попадает в первого игрока на пути;
    * рельеф закрывает луч, кроме полного заряда — тот прошивает землю насквозь.
-   * Урон — по заряду (10…300), без множителя за голову.
+   * Урон — по заряду (20…300) с лёгким затуханием по дальности; голова — крит.
    */
   private fireBeam(p: PlayerState, c: number, big: boolean): void {
     const eyeY = p.y + EYE_HEIGHT - CROUCH_DROP * p.crouch;
@@ -678,11 +778,15 @@ export class GameServer {
     let len = BEAM_RANGE;
     if (!pierce) {
       for (let s = 0.5; s <= BEAM_RANGE; s += 0.5) {
-        if (eyeY + d[1] * s < this.map.heightAt(p.x + d[0] * s, p.z + d[2] * s)) {
+        if (this.map.blockedAt(p.x + d[0] * s, eyeY + d[1] * s, p.z + d[2] * s)) {
           len = s - 0.25;
           break;
         }
       }
+    }
+    if (p.shop.has("cone")) {
+      this.fireCone(p, c, big, eyeY, d, len, pierce);
+      return;
     }
     const ex = p.x + d[0] * len;
     const ey = eyeY + d[1] * len;
@@ -700,7 +804,99 @@ export class GameServer {
     const oy = eyeY + d[1] * 0.5 - cp * 0.14;
     const oz = p.z + d[2] * 0.5 - sy * 0.16 + cy * sp * 0.14;
     this.broadcast({ t: "beam", owner: p.id, x: ox, y: oy, z: oz, ex: p.x + (ex - p.x) * endT, ey: eyeY + (ey - eyeY) * endT, ez: p.z + (ez - p.z) * endT, c, pierce, big });
-    if (first) this.dealDamage(p.id, first.p, first.hit.part, beamDamage(c));
+    if (first) {
+      const shielded = first.p.shield; // щит поглощает попадание — и заморозку тоже
+      this.dealDamage(p.id, first.p, first.hit.part, hitDamage(beamDamage(c), first.hit.part, len * endT, BEAM_FALLOFF));
+      if (!shielded && p.shop.has("freeze")) this.freeze(first.p, FREEZE_BEAM);
+    }
+  }
+
+  /** «Остановка времени»: цель застывает на dur секунд, заряд и «эхо» срываются; клиенты узнают из сообщения */
+  private freeze(q: PlayerState, dur: number): void {
+    if (!q.alive || dur <= 0) return;
+    q.frozenT = Math.max(q.frozenT, dur);
+    q.charging = false;
+    q.echoT = -1;
+    q.beamEchoT = -1;
+    this.broadcast({ t: "freeze", id: q.id, dur });
+  }
+
+  /**
+   * Конусный луч (покупка): радиус конуса растёт с дальностью, задевает всех, чьё тело
+   * (ступни, торс или голова) попало внутрь; рельеф закрывает цель, кроме полного заряда.
+   * Урон — луч ×CONE_DMG_MULT, режется дважды (coneFactor): по ширине сечения в точке
+   * попадания (дальность) и по удалению от оси (0% на оси, CONE_EDGE_LOSS на границе). Голова — крит, если по ней попала сама ось луча.
+   */
+  private fireCone(p: PlayerState, c: number, big: boolean, eyeY: number, d: readonly number[], len: number, pierce: boolean): void {
+    const cy = Math.cos(p.yaw);
+    const sy = Math.sin(p.yaw);
+    const cp = Math.cos(p.pitch);
+    const sp = Math.sin(p.pitch);
+    const ex = p.x + d[0] * len;
+    const ey = eyeY + d[1] * len;
+    const ez = p.z + d[2] * len;
+    this.broadcast({
+      t: "beam",
+      owner: p.id,
+      x: p.x + d[0] * 0.5 + cy * 0.16 + sy * sp * 0.14,
+      y: eyeY + d[1] * 0.5 - cp * 0.14,
+      z: p.z + d[2] * 0.5 - sy * 0.16 + cy * sp * 0.14,
+      ex,
+      ey,
+      ez,
+      c,
+      pierce,
+      big,
+      cone: true,
+    });
+    const widen = big ? BIG_RADIUS_MULT : 1; // перк «крупный заряд» ширит и конус
+    const base = beamDamage(c) * CONE_DMG_MULT;
+    for (const q of this.players.values()) {
+      if (!q.alive || q.id === p.id) continue;
+      // Лучшая из трёх точек тела: та, что глубже всего внутри конуса
+      let along = -1;
+      let bestSlack = Infinity;
+      let bestRel = 1; // расстояние от оси / радиус сечения у этой точки
+      let bestRad = 1; // радиус сечения у этой точки
+      const ys = [q.y + 0.3, q.y + 0.9, headCenterY(q.y, q.crouch)];
+      for (const y of ys) {
+        const vx = q.x - p.x;
+        const vy = y - eyeY;
+        const vz = q.z - p.z;
+        const a = vx * d[0] + vy * d[1] + vz * d[2];
+        if (a < 0.3 || a > len) continue;
+        const lat = Math.hypot(vx - a * d[0], vy - a * d[1], vz - a * d[2]);
+        const rad = coneRadius(a, c) * widen;
+        const slack = lat - rad;
+        if (slack < bestSlack) {
+          bestSlack = slack;
+          bestRel = lat / rad;
+          bestRad = rad;
+          along = a;
+        }
+      }
+      if (along < 0 || bestSlack > BODY_RADIUS) continue;
+      if (!pierce && !this.clearLine(p.x, eyeY, p.z, q.x, q.y + 0.9, q.z)) continue;
+      const direct = segmentVsPlayer(p.x, eyeY, p.z, ex, ey, ez, q, 0.04);
+      const part: HitPart = direct && direct.part === "head" ? "head" : "body";
+      const cut = coneFactor(bestRad, bestRel);
+      const dmg = base * cut * (part === "head" ? CRIT_MULT : 1);
+      const shielded = q.shield;
+      this.dealDamage(p.id, q, part, Math.max(1, Math.round(dmg)));
+      // Заморозка режется теми же множителями, что и урон: по оси вблизи — полная секунда
+      if (!shielded && p.shop.has("freeze")) this.freeze(q, Math.max(FREEZE_CONE_MIN, FREEZE_CONE_MAX * cut));
+    }
+  }
+
+  /** Нет ли между двумя точками рельефа, стен и платформ */
+  private clearLine(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
+    const dist = Math.hypot(bx - ax, by - ay, bz - az);
+    const n = Math.max(2, Math.ceil(dist / 0.5));
+    for (let i = 1; i < n; i++) {
+      const s = i / n;
+      if (this.map.blockedAt(ax + (bx - ax) * s, ay + (by - ay) * s, az + (bz - az) * s)) return false;
+    }
+    return true;
   }
 
   // ---------- Попадания ----------
@@ -719,7 +915,8 @@ export class GameServer {
   private finishBolt(b: Bolt, victim: PlayerState | null, hit: Hit | null, x: number, y: number, z: number): void {
     this.broadcast({ t: "pend", id: b.id, x, y, z, part: hit ? hit.part : null, victim: victim ? victim.id : 0 });
     if (!victim || !hit) return;
-    this.dealDamage(b.owner, victim, hit.part, hit.part === "head" ? DMG_HEAD : DMG_BODY);
+    const dist = Math.hypot(x - b.ox, y - b.oy, z - b.oz);
+    this.dealDamage(b.owner, victim, hit.part, hitDamage(DMG_BODY, hit.part, dist, BOLT_FALLOFF));
   }
 
   /** Попадание: щит, урон, смерть и награды — общий путь для заряда и луча */
@@ -736,13 +933,17 @@ export class GameServer {
     }
 
     victim.bot?.noteHit(owner, this.clock);
+    const dealt = Math.min(dmg, victim.hp);
     victim.hp = Math.max(0, victim.hp - dmg);
+    const attacker = this.players.get(owner);
+    if (attacker && attacker.alive && attacker.shop.has("vamp")) attacker.hp = Math.min(MAX_HP, attacker.hp + dealt * VAMP_HEAL);
     this.broadcast({ t: "hit", attacker: owner, victim: victim.id, part, dmg, hp: victim.hp, absorbed: false });
     if (victim.hp > 0) return;
     victim.alive = false;
     victim.charging = false;
     victim.respawn = RESPAWN_TIME;
     victim.deaths++;
+    this.dropCoins(victim);
     this.rewardDeath(victim);
     const killer = this.players.get(owner);
     if (killer) {
@@ -766,7 +967,7 @@ export class GameServer {
       const s = i / 3;
       const px = b.x + (nx - b.x) * s;
       const pz = b.z + (nz - b.z) * s;
-      if (b.y + (ny - b.y) * s < this.map.heightAt(px, pz)) {
+      if (this.map.blockedAt(px, b.y + (ny - b.y) * s, pz)) {
         groundT = s;
         break;
       }
@@ -836,6 +1037,7 @@ export class GameServer {
     p.mana = p.stats.manaMax;
     p.lock = 0;
     p.cooldown = 0;
+    p.frozenT = 0;
     p.alive = true;
     p.respawn = 0;
     p.bot?.respawn(s.x, s.y, s.z);
@@ -852,6 +1054,7 @@ export class GameServer {
 
     for (const p of this.players.values()) {
       if (p.cooldown > 0) p.cooldown = Math.max(0, p.cooldown - dt);
+      if (p.frozenT > 0) p.frozenT = Math.max(0, p.frozenT - dt);
       if (p.alive) {
         this.updateMana(p, dt);
         if (p.charging) {
@@ -873,6 +1076,7 @@ export class GameServer {
     }
     this.tickBots(dt);
     this.tickGadgets(dt);
+    this.tickCoins(dt);
     this.bolts = this.bolts.filter((b) => this.stepBolt(b, dt));
 
     // Снимок мира: общая часть одна на всех, «я» — персональная
@@ -896,6 +1100,8 @@ export class GameServer {
         perks: l.perks,
         gadget: l.gadget ? { id: l.gadget, left: Math.max(0, p.gadgetLeft) } : null,
         shield: p.shield,
+        gold: p.gold,
+        shop: [...p.shop],
         charge: p.charging ? this.chargeOf(p) : -1,
       };
       this.send(p, { t: "snap", players: list, me });

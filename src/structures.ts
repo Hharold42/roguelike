@@ -9,15 +9,22 @@
  * лучи упираются в неё, как в рельеф. Под каждой постройкой рельеф выровнен
  * (Terrain.zones), чтобы ступени и стены стояли ровно.
  *
- * Зоны трёх видов:
+ * Летающие платформы — тонкие коробки, повисшие в воздухе (floating): под ними
+ * можно ходить, снизу их можно пробить прыжком, а сверху на них можно встать.
+ * Для них физика спрашивает опору с учётом высоты ступней (supportAt), а
+ * заряды — попадание в точку (hitFloating).
+ *
+ * Зоны пяти видов:
  *  – «зиккурат»: три яруса-платформы со ступенями с одной стороны;
  *  – «форт»: кольцо стен с двумя проходами, башни по углам, лестница на стену,
  *    внутри платформа и укрытия;
  *  – «руины»: разрозненные стены разной высоты (низкие перепрыгиваются) и
- *    небольшая платформа.
+ *    небольшая платформа;
+ *  – «укрытия»: короткие стены Г-образно, коридором или с колоннами;
+ *  – «небо»: кольцо летающих платформ вокруг высокой центральной.
  */
 
-export type ZoneKind = "ziggurat" | "fort" | "ruins";
+export type ZoneKind = "ziggurat" | "fort" | "ruins" | "cover" | "sky";
 
 export interface PlannedZone {
   kind: ZoneKind;
@@ -36,6 +43,12 @@ export interface Zone extends PlannedZone {
 export const MAT_WALL = 0;
 export const MAT_PLATFORM = 1;
 export const MAT_STAIRS = 2;
+export const MAT_SKY = 3;
+
+/** Выше этого от ступни стена не пускает (ступени лестницы — 0.4) */
+export const STEP_UP = 0.55;
+/** Высота тела для проверки «задеваю ли головой» (под платформой с низом выше — проходим) */
+export const BODY_H = 1.7;
 
 export interface Box {
   x0: number;
@@ -43,9 +56,11 @@ export interface Box {
   z0: number;
   z1: number;
   top: number;
-  /** Низ (глубоко под землёй — виден только то, что выше рельефа) */
+  /** Низ (у стоящих на земле — глубоко под землёй, у летающих — чуть ниже верха) */
   bot: number;
   mat: number;
+  /** Летающая платформа: под ней можно пройти */
+  floating: boolean;
 }
 
 /** Шаги по высоте: подъём одной ступени меньше STEP_UP игрока (0.55) */
@@ -56,8 +71,10 @@ const BOX_DEPTH = 8;
 /** Мир: половина размера, юнитов */
 const WORLD_HALF = 128;
 
-const ZONE_HALF: Record<ZoneKind, number> = { ziggurat: 16, fort: 20, ruins: 17 };
-const MAX_ZONES = 8;
+const ZONE_HALF: Record<ZoneKind, number> = { ziggurat: 16, fort: 20, ruins: 17, cover: 10, sky: 14 };
+const MAX_ZONES = 14;
+/** Порядок видов при раскладке: крупные и мелкие чередуются */
+const ZONE_ORDER: ZoneKind[] = ["fort", "sky", "cover", "ziggurat", "cover", "ruins", "sky", "cover"];
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -72,16 +89,15 @@ function mulberry32(seed: number): () => number {
 /** Раскладка зон по сиду: далеко от спавна и края, зоны не перекрываются */
 export function planZones(seed: number): PlannedZone[] {
   const rnd = mulberry32((seed ^ 0x57ac1) >>> 0);
-  const kinds: ZoneKind[] = ["fort", "ziggurat", "ruins"];
   const out: PlannedZone[] = [];
-  for (let attempt = 0; attempt < 600 && out.length < MAX_ZONES; attempt++) {
-    const kind = kinds[out.length % kinds.length];
+  for (let attempt = 0; attempt < 3000 && out.length < MAX_ZONES; attempt++) {
+    const kind = ZONE_ORDER[out.length % ZONE_ORDER.length];
     const half = ZONE_HALF[kind];
     const lim = WORLD_HALF - half - 6;
     const x = (rnd() * 2 - 1) * lim;
     const z = (rnd() * 2 - 1) * lim;
     if (Math.hypot(x, z) < half + 26) continue; // спавн должен остаться свободным
-    if (out.some((o) => Math.max(Math.abs(o.x - x), Math.abs(o.z - z)) < o.half + half + 12)) continue;
+    if (out.some((o) => Math.max(Math.abs(o.x - x), Math.abs(o.z - z)) < o.half + half + 10)) continue;
     out.push({ kind, x, z, half });
   }
   return out;
@@ -125,6 +141,24 @@ class Builder {
       top,
       bot: top - BOX_DEPTH,
       mat,
+      floating: false,
+    });
+  }
+
+  /** Летающая платформа: верх на h над землёй зоны, толщина thick (низ — не ниже BODY_H над землёй) */
+  float(lx0: number, lx1: number, lz0: number, lz1: number, h: number, thick: number, mat: number): void {
+    const [ax, az] = rot(this.k, lx0, lz0);
+    const [bx, bz] = rot(this.k, lx1, lz1);
+    const top = this.level + h;
+    this.boxes.push({
+      x0: this.cx + Math.min(ax, bx),
+      x1: this.cx + Math.max(ax, bx),
+      z0: this.cz + Math.min(az, bz),
+      z1: this.cz + Math.max(az, bz),
+      top,
+      bot: top - thick,
+      mat,
+      floating: true,
     });
   }
 
@@ -207,6 +241,42 @@ function buildRuins(b: Builder, rnd: () => number): void {
   }
 }
 
+function buildCover(b: Builder, rnd: () => number): void {
+  const variant = Math.floor(rnd() * 3);
+  if (variant === 0) {
+    // Г-образная стена
+    b.add(-7, 3, -1, 1, 2.4, MAT_WALL);
+    b.add(1, 3, -7, 1, 2.4, MAT_WALL);
+    b.add(-7, -5, 4, 6, 1.4, MAT_WALL);
+  } else if (variant === 1) {
+    // Коридор из двух стен и низкая стенка посередине
+    b.add(-7, 7, -5, -3, 2.4, MAT_WALL);
+    b.add(-7, 7, 3, 5, 2.4, MAT_WALL);
+    b.add(-1, 1, -1, 1, 1.4, MAT_WALL);
+  } else {
+    // Четыре колонны, соединённые низкими стенками
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) b.add(sx * 5 - 1, sx * 5 + 1, sz * 5 - 1, sz * 5 + 1, 3.2, MAT_WALL);
+    b.add(-4, 4, -6, -4, 1.4, MAT_WALL);
+    b.add(-4, 4, 4, 6, 1.4, MAT_WALL);
+  }
+}
+
+function buildSky(b: Builder, rnd: () => number): void {
+  const T = 0.8; // толщина платформ
+  // Кольцо из пяти платформ вокруг высокой центральной; первая — низкая, туда запрыгнуть с блока
+  const heights = [3.0, 3.9, 5.1, 6.3, 4.5];
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2;
+    const cx = Math.cos(a) * 8;
+    const cz = Math.sin(a) * 8;
+    const h = heights[i] + (rnd() - 0.5) * 0.2;
+    b.float(cx - 2.5, cx + 2.5, cz - 2.5, cz + 2.5, h, T, MAT_SKY);
+  }
+  b.float(-3.5, 3.5, -3.5, 3.5, 8.0, T, MAT_SKY);
+  // Блок-ступень к первой платформе (на оси +x, у её внешнего края)
+  b.add(11, 13, -1, 1, 1.4, MAT_WALL);
+}
+
 export function buildBoxes(zones: readonly Zone[], seed: number): Box[] {
   const rnd = mulberry32((seed ^ 0x9e3779) >>> 0);
   const all: Box[] = [];
@@ -214,6 +284,8 @@ export function buildBoxes(zones: readonly Zone[], seed: number): Box[] {
     const b = new Builder(z.x, z.z, z.level, Math.floor(rnd() * 4));
     if (z.kind === "ziggurat") buildZiggurat(b);
     else if (z.kind === "fort") buildFort(b);
+    else if (z.kind === "cover") buildCover(b, rnd);
+    else if (z.kind === "sky") buildSky(b, rnd);
     else buildRuins(b, rnd);
     for (const box of b.boxes) all.push(box);
   }
@@ -248,22 +320,68 @@ export class Structures {
     return c < 0 ? 0 : c >= GRID_DIM ? GRID_DIM - 1 : c;
   }
 
-  /** Верх самой высокой коробки над точкой (−∞, если там нет построек) */
+  /** Клетка сетки с точкой (x, z) */
+  private cellList(x: number, z: number): number[] {
+    return this.grid[this.cell(z) * GRID_DIM + this.cell(x)];
+  }
+
+  /** Верх самой высокой стоящей на земле коробки над точкой (−∞, если там нет построек) */
   topAt(x: number, z: number): number {
     return this.solidTopAt(x, z, 0);
   }
 
   /**
-   * Верх самой высокой коробки, чей контур, расширенный на r, накрывает точку.
-   * Так тело радиуса r не заходит в стену: для движения берётся r = радиус игрока.
+   * Верх самой высокой стоящей на земле коробки, чей контур, расширенный на r,
+   * накрывает точку (летающие не считаются). Для спавна и гаджетов.
    */
   solidTopAt(x: number, z: number, r: number): number {
-    const cellList = this.grid[this.cell(z) * GRID_DIM + this.cell(x)];
+    const list = this.cellList(x, z);
     let top = -Infinity;
-    for (let i = 0; i < cellList.length; i++) {
-      const b = this.boxes[cellList[i]];
+    for (let i = 0; i < list.length; i++) {
+      const b = this.boxes[list[i]];
+      if (b.floating) continue;
       if (b.top > top && x >= b.x0 - r && x <= b.x1 + r && z >= b.z0 - r && z <= b.z1 + r) top = b.top;
     }
     return top;
+  }
+
+  /**
+   * Опора от летающих платформ под точкой: верх самой высокой, до которой
+   * ступни (на высоте y) дотягиваются с запасом reach; −∞ — нет такой.
+   */
+  supportAt(x: number, z: number, y: number, reach: number): number {
+    const list = this.cellList(x, z);
+    let top = -Infinity;
+    for (let i = 0; i < list.length; i++) {
+      const b = this.boxes[list[i]];
+      if (!b.floating || b.top <= top || b.top > y + reach) continue;
+      if (x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1) top = b.top;
+    }
+    return top;
+  }
+
+  /**
+   * Не пускает ли постройка тело (радиус r, ступни на высоте y) в точку (x, z):
+   * коробка со стеной выше ступени больше чем на STEP_UP и с низом ниже макушки.
+   * Под летающей платформой с высоким низом проходим.
+   */
+  blocks(x: number, z: number, y: number, r: number): boolean {
+    const list = this.cellList(x, z);
+    for (let i = 0; i < list.length; i++) {
+      const b = this.boxes[list[i]];
+      if (b.top <= y + STEP_UP || b.bot >= y + BODY_H) continue;
+      if (x >= b.x0 - r && x <= b.x1 + r && z >= b.z0 - r && z <= b.z1 + r) return true;
+    }
+    return false;
+  }
+
+  /** Точка внутри летающей платформы — для зарядов, лучей и линии видимости */
+  hitFloating(x: number, y: number, z: number): boolean {
+    const list = this.cellList(x, z);
+    for (let i = 0; i < list.length; i++) {
+      const b = this.boxes[list[i]];
+      if (b.floating && y >= b.bot && y <= b.top && x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1) return true;
+    }
+    return false;
   }
 }

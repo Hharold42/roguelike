@@ -11,7 +11,7 @@
  */
 
 import { CHUNK_CELLS, TILE, Terrain } from "../terrain";
-import { Structures } from "../structures";
+import { STEP_UP, Structures } from "../structures";
 
 export const CELL = TILE; // 2 юнита на колонну
 export const TILE_CELLS = CHUNK_CELLS; // 16 колонок в тайле (тайл = чанк террейна, 32 юнита)
@@ -147,6 +147,21 @@ export class ColumnMap {
     const g = this.sampleGround(wx, wz, GROUND_SCRATCH) ? GROUND_SCRATCH.h : this.terrain.getHeight(wx, wz);
     const s = this.structures.topAt(wx, wz);
     return s > g ? s : g;
+  }
+
+  /**
+   * Опора под ступнями на высоте y: земля, стоящие на ней постройки и летающие
+   * платформы, до которых ступни дотягиваются (под платформой над головой — земля).
+   */
+  groundAt(wx: number, wz: number, y: number): number {
+    const h = this.heightAt(wx, wz);
+    const s = this.structures.supportAt(wx, wz, y, STEP_UP);
+    return s > h ? s : h;
+  }
+
+  /** Твёрдая ли точка мира: под землёй, внутри стены или внутри летающей платформы */
+  blockedAt(wx: number, wy: number, wz: number): boolean {
+    return wy < this.heightAt(wx, wz) || this.structures.hitFloating(wx, wy, wz);
   }
 
   /** Высота только рельефа (без построек) */

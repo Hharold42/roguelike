@@ -1,3 +1,20 @@
+/* Игра не текстовая страница: ничего не выделяется и не перетаскивается */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+*::selection {
+  background: transparent;
+}
+
+img,
+canvas {
+  -webkit-user-drag: none;
+}
+
 html,
 body {
   margin: 0;
@@ -47,6 +64,15 @@ body {
   opacity: 0;
   pointer-events: none;
   background: radial-gradient(ellipse at center, rgba(180, 0, 0, 0) 40%, rgba(200, 0, 0, 0.85) 100%);
+}
+
+/* Остановка времени: ледяное затемнение экрана, пока я застыл (яркость задаёт HUD) */
+#freeze {
+  position: fixed;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, rgba(120, 190, 255, 0.1) 30%, rgba(90, 160, 255, 0.55) 100%);
 }
 
 #crosshair {
@@ -257,6 +283,45 @@ body {
   text-shadow: 0 1px 2px #000;
 }
 
+/* Цифры урона у врагов: позицию и прозрачность задаёт HUD каждый кадр */
+#dmgNums {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.dmg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  color: #fff;
+  font: bold 18px/1 monospace;
+  text-shadow:
+    0 0 3px #000,
+    0 1px 2px #000,
+    1px 0 0 #000,
+    -1px 0 0 #000;
+  white-space: nowrap;
+  will-change: transform;
+}
+
+.dmg.head {
+  color: #ffd12e;
+  font-size: 24px;
+}
+
+.dmg.shield {
+  color: #6cf;
+  font-size: 15px;
+}
+
+.dmg.off {
+  display: none;
+}
+
 /* Затемнение краёв при заряде луча: «прицельный» тоннельный эффект, яркость задаёт HUD */
 #scope {
   position: fixed;
@@ -411,4 +476,63 @@ body {
   font: 22px/1.4 monospace;
   text-align: center;
   pointer-events: none;
+}
+
+/* Монеты и магазин */
+#gold {
+  color: #ffd24a;
+  font: 14px/1.4 monospace;
+  text-shadow: 0 1px 2px #000;
+}
+
+#shop {
+  display: none;
+  position: fixed;
+  top: 50%;
+  right: 24px;
+  transform: translateY(-50%);
+  width: 360px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.78);
+  border: 1px solid #ffd24a;
+  color: #fff;
+  font: 13px/1.4 monospace;
+  user-select: none;
+}
+
+.shop-head {
+  margin-bottom: 8px;
+  color: #ffd24a;
+}
+
+.shop-row {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-left: 4px solid #888;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+}
+
+.shop-row.can {
+  border-color: #6fd36f;
+}
+
+.shop-row.cant {
+  border-color: #c0504d;
+  opacity: 0.7;
+}
+
+.shop-row.owned {
+  border-color: #ffd24a;
+  opacity: 0.55;
+}
+
+.shop-title {
+  font-weight: bold;
+}
+
+.shop-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  opacity: 0.85;
 }

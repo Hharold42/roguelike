@@ -117,6 +117,26 @@ export class SoftRenderer {
     this.focal = this.baseFocal * zoom;
   }
 
+  /**
+   * Проекция мировой точки на экран текущей камеры (после begin): доли экрана
+   * 0..1 по x и y и расстояние вдоль взгляда; null — точка за спиной.
+   */
+  project(x: number, y: number, z: number): { sx: number; sy: number; depth: number } | null {
+    const dx = x - this.camX;
+    const dy = y - this.camY;
+    const dz = z - this.camZ;
+    const { sinY, cosY, sinP, cosP } = this;
+    const depth = dx * sinY * cosP + dy * sinP + dz * cosY * cosP;
+    if (depth < 0.3) return null;
+    const right = dx * cosY - dz * sinY;
+    const up = -dx * sinY * sinP + dy * cosP - dz * cosY * sinP;
+    return {
+      sx: (this.W / 2 + (right / depth) * this.focal) / this.W,
+      sy: (this.H / 2 - (up / depth) * this.focal) / this.H,
+      depth,
+    };
+  }
+
   // ---------- Кадр ----------
 
   /** Начать кадр: небо + мир + трава. pitch — радианы, > 0 — взгляд вверх */

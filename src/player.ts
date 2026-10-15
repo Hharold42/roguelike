@@ -4,11 +4,12 @@
  * coyote time и буфер прыжка, присед, спринт. Опора — рельеф и верх построек
  * (groundAt); стены построек не пускают (solidTopAt), если их верх выше ступни
  * больше чем на STEP_UP — низкие ступени проходятся пешком, низкие стенки
- * перепрыгиваются.
+ * перепрыгиваются. Есть двойной прыжок (один в воздухе) и рывок-уворот.
  * Позиция ограничена границами мира (невидимая стена на краю).
  */
 
 import { clamp } from "./mathUtil";
+import { STEP_UP } from "./structures";
 import { CROUCH_DROP, EYE_HEIGHT, LAND_DROP } from "./shared/game";
 
 export interface MoveInput {
@@ -21,6 +22,8 @@ export interface MoveInput {
   jumpHeld: boolean;
   crouch: boolean;
   sprint: boolean;
+  /** Рывок-уворот в этом кадре (двойное нажатие Shift): по движению, без ввода — назад */
+  dash?: boolean;
 }
 
 export const BASE_SPEED = 6; // юнитов/с
@@ -41,8 +44,13 @@ const COYOTE_TIME = 0.1; // с после схода с края ещё можн
 const JUMP_BUFFER = 0.12; // нажатие чуть раньше приземления не теряется
 /** Радиус тела при столкновении с постройками */
 export const COLLIDE_R = 0.35;
-/** Выше этого от ступни стена не пускает (ступени лестницы — 0.4) */
-export const STEP_UP = 0.55;
+/** Двойной прыжок: сколько прыжков доступно в воздухе и их скорость */
+const AIR_JUMPS = 1;
+const AIR_JUMP_SPEED = 10.4;
+/** Рывок: скорость, длительность и перезарядка */
+export const DASH_SPEED = 17;
+const DASH_TIME = 0.2;
+export const DASH_COOLDOWN = 1.0;
 const STEP_DOWN = 0.5; // опора ушла ниже на столько за кадр — падаем (сошли с уступа)
 
 const CROUCH_RATE = 10; // скорость перехода в присед и обратно (1/с)
@@ -73,6 +81,14 @@ export class Player {
   speedFwd = 0;
   speedSide = 0;
 
+  /** Сколько воздушных прыжков уже потрачено */
+  private airJumps = 0;
+  private dashT = 0;
+  private dashX = 0;
+  private dashZ = 0;
+  /** Секунд до следующего рывка */
+  dashCd = 0;
+
   private coyote = 0;
   private jumpBuf = 0;
   private prevJumpHeld = false;
@@ -92,6 +108,8 @@ export class Player {
     this.onGround = true;
     this.airTime = 0;
     this.land = this.landDip = this.crouch = 0;
+    this.airJumps = 0;
+    this.dashT = this.dashCd = 0;
   }
 
   /** Высота глаз над уровнем мира (присед и амортизация приземления опускают взгляд) */
@@ -105,17 +123,18 @@ export class Player {
   }
 
   /**
-   * Шаг физики. groundAt(x, z) — высота опоры; bound — половина размера мира
-   * (позиция клампится в ±bound). solidTopAt(x, z) — верх построек, расширенных
-   * на радиус тела (−∞ если пусто): по осям отдельно, чтобы скользить вдоль стен.
+   * Шаг физики. groundAt(x, z, y) — высота опоры для ступней на высоте y; bound —
+   * половина размера мира (позиция клампится в ±bound). blocked(x, z, y) — не
+   * пускает ли постройка тело в точку: проверяется по осям отдельно, чтобы
+   * скользить вдоль стен.
    */
   update(
     dt: number,
     input: MoveInput,
     yaw: number,
-    groundAt: (x: number, z: number) => number,
+    groundAt: (x: number, z: number, y: number) => number,
     bound: number,
-    solidTopAt?: (x: number, z: number) => number,
+    blocked?: (x: number, z: number, y: number) => boolean,
   ): void {
     // Таймеры
     this.coyote = this.onGround ? COYOTE_TIME : Math.max(0, this.coyote - dt);
@@ -133,8 +152,28 @@ export class Player {
     const tx = (sy * input.fwd + cy * input.side) * k * max;
     const tz = (cy * input.fwd - sy * input.side) * k * max;
 
+    // Рывок: направление по вводу (без ввода — назад), скорость держится DASH_TIME
+    this.dashCd = Math.max(0, this.dashCd - dt);
+    if (input.dash && this.dashCd <= 0 && this.dashT <= 0) {
+      let f = input.fwd;
+      let sd = input.side;
+      if (len <= 0.01) {
+        f = -1;
+        sd = 0;
+      }
+      const l = Math.hypot(f, sd) || 1;
+      this.dashX = (sy * f + cy * sd) / l;
+      this.dashZ = (cy * f - sy * sd) / l;
+      this.dashT = DASH_TIME;
+      this.dashCd = DASH_COOLDOWN;
+    }
+
     // Разгон/торможение: на земле резко, в воздухе слабо (инерция)
-    if (this.onGround) {
+    if (this.dashT > 0) {
+      this.dashT -= dt;
+      this.vx = this.dashX * DASH_SPEED * this.speedMul;
+      this.vz = this.dashZ * DASH_SPEED * this.speedMul;
+    } else if (this.onGround) {
       const rate = len > 0.01 ? GROUND_ACCEL : GROUND_DECEL;
       const f = Math.min(1, rate * dt);
       this.vx += (tx - this.vx) * f;
@@ -152,15 +191,14 @@ export class Player {
 
     let nx = clamp(this.x + this.vx * dt, -bound, bound);
     let nz = clamp(this.z + this.vz * dt, -bound, bound);
-    if (solidTopAt) {
-      const reach = this.y + STEP_UP;
+    if (blocked) {
       // Уже внутри расширенного контура (приземлились вплотную) — не запираем, даём выйти
-      if (solidTopAt(this.x, this.z) <= reach) {
-        if (solidTopAt(nx, this.z) > reach) {
+      if (!blocked(this.x, this.z, this.y)) {
+        if (blocked(nx, this.z, this.y)) {
           nx = this.x;
           this.vx = 0;
         }
-        if (solidTopAt(nx, nz) > reach) {
+        if (blocked(nx, nz, this.y)) {
           nz = this.z;
           this.vz = 0;
         }
@@ -170,18 +208,27 @@ export class Player {
     this.z = nz;
 
     // Прыжок: буфер + coyote
+    let jumped = false;
     if (this.jumpBuf > 0 && this.coyote > 0) {
+      jumped = true;
       this.vy = JUMP_SPEED;
       this.onGround = false;
       this.coyote = 0;
       this.jumpBuf = 0;
       this.airTime = 0;
     }
+    // Двойной прыжок: нажатие в воздухе, когда обычный (coyote) уже недоступен
+    if (this.onGround) this.airJumps = 0;
+    else if (!jumped && input.jump && this.coyote <= 0 && this.airJumps < AIR_JUMPS) {
+      this.airJumps++;
+      this.vy = AIR_JUMP_SPEED;
+      this.jumpBuf = 0;
+    }
     // Обрезка взлёта: отпустили клавишу прыжка на подъёме — скорость режется один раз
     if (!input.jumpHeld && this.prevJumpHeld && this.vy > 0) this.vy *= JUMP_CUT;
     this.prevJumpHeld = input.jumpHeld;
 
-    const ground = groundAt(this.x, this.z);
+    const ground = groundAt(this.x, this.z, this.y);
     if (this.onGround) {
       const dy = ground - this.y;
       if (dy < -STEP_DOWN) {
@@ -204,6 +251,7 @@ export class Player {
         this.y = ground;
         this.onGround = true;
         this.land = clamp(-this.vy / 14, 0, 1);
+        this.airJumps = 0;
         this.vy = 0;
       }
     }
